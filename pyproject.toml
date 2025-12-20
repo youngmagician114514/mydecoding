@@ -1,0 +1,13 @@
+[project]
+name = "mydecoding"
+version = "0.1.0"
+description = "Belief-fused speculative decoding on Llama-3B (Hydra-inspired)"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
