@@ -1,8 +1,9 @@
 import argparse
 import torch
 
-from .config import DualDecoderConfig
-from .model import DualDecoderModel
+from mydecoding.config.dual_decoder import DualDecoderConfig
+from mydecoding.models.dual_decoder import DualDecoderModel
+
 
 
 def build_model(model_name: str) -> DualDecoderModel:

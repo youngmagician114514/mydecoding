@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import default_data_collator
 
-from .model import DualDecoderModel
+from mydecoding.models.dual_decoder import DualDecoderModel
 
 
 def train_step(model: DualDecoderModel, batch: dict, optimizer, scaler=None):

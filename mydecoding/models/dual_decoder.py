@@ -5,116 +5,11 @@ from dataclasses import dataclass
 from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .config import DualDecoderConfig
-from .fusion import BeliefFusion
-
-
-class CandidateDraftHead(nn.Module):
-    """
-    Head1: propose top-k next tokens with a lightweight prefix MLP (Hydra-style).
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        hidden_proj: int,
-        num_layers: int,
-        num_candidates: int,
-    ):
-        super().__init__()
-        layers = []
-        for _ in range(num_layers):
-            layers.append(nn.Linear(hidden_size, hidden_proj))
-            layers.append(nn.SiLU())
-            layers.append(nn.Linear(hidden_proj, hidden_size))
-        self.prefix_mlp = nn.Sequential(*layers)
-        self.num_candidates = num_candidates
-
-    def forward(self, base_hidden: torch.Tensor, lm_head_weight: torch.Tensor):
-        """
-        Args:
-            base_hidden: (batch, seq, hidden) from the frozen base model.
-            lm_head_weight: shared LM head weight from the base model.
-        Returns:
-            draft_logits: (batch, vocab)
-            candidate_ids: (batch, k)
-            belief: (batch, k) confidence scores for candidates
-        """
-        h = self.prefix_mlp(base_hidden[:, -1, :])  # summarize with last token
-        draft_logits = F.linear(h, lm_head_weight)  # tie to base vocab
-        probs = F.softmax(draft_logits, dim=-1)
-        belief_values, candidate_ids = torch.topk(probs, k=self.num_candidates, dim=-1)
-        return draft_logits, candidate_ids, belief_values
-
-
-class FusionDecoder(nn.Module):
-    """
-    Head2: a tiny Transformer decoder conditioned on fused latent z_{t+1}.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        vocab_size: int,
-        num_layers: int,
-        num_heads: int,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=hidden_size * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-        self.out_proj = nn.Linear(hidden_size, vocab_size, bias=False)
-
-    def forward(
-        self,
-        fused_latent: torch.Tensor,
-        history_hidden: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ):
-        """
-        Args:
-            fused_latent: (batch, hidden)
-            history_hidden: (batch, seq, hidden)
-            lm_head_weight: shared LM head weight from the base model.
-            attention_mask: (batch, seq)
-        Returns:
-            logits: (batch, vocab)
-            decoder_state: (batch, hidden)
-        """
-        tgt = fused_latent.unsqueeze(1)  # (batch, 1, hidden)
-        memory = history_hidden
-        # Use attention mask to ignore padding positions in memory
-        memory_key_padding_mask = None
-        if attention_mask is not None:
-            memory_key_padding_mask = attention_mask == 0
-        decoded = self.decoder(
-            tgt=tgt,
-            memory=memory,
-            memory_key_padding_mask=memory_key_padding_mask,
-        )
-        decoded_last = decoded[:, -1, :]
-        logits = F.linear(decoded_last, lm_head_weight)
-        return logits, decoded_last
-
-
-@dataclass
-class DualDecoderOutput:
-    loss: Optional[torch.Tensor]
-    head1_loss: Optional[torch.Tensor]
-    head2_loss: Optional[torch.Tensor]
-    draft_logits: torch.Tensor
-    fusion_logits: torch.Tensor
-    candidate_ids: torch.Tensor
-    fused_latent: torch.Tensor
-
+from mydecoding.config.dual_decoder import DualDecoderConfig
+from mydecoding.modules.draft_head import CandidateDraftHead
+from mydecoding.modules.fusion import BeliefFusion
+from mydecoding.modules.head2 import FusionDecoder
+from mydecoding.models.outputs import DualDecoderOutput
 
 class DualDecoderModel(nn.Module):
     """
@@ -145,9 +40,12 @@ class DualDecoderModel(nn.Module):
 
         self.draft_head = CandidateDraftHead(
             hidden_size=hidden_size,
+            vocab_size=vocab_size,
             hidden_proj=config.draft_hidden_size,
-            num_layers=config.draft_num_layers,
+            num_mlp_layers=config.draft_num_layers,
             num_candidates=config.num_draft_candidates,
+            num_heads=config.decoder_num_heads,
+            dropout=config.decoder_dropout,
         )
         self.fusion = BeliefFusion(
             hidden_size=hidden_size,
@@ -182,19 +80,21 @@ class DualDecoderModel(nn.Module):
             )
         base_hidden = base_out.hidden_states[-1]
 
-        draft_logits, candidate_ids, belief = self.draft_head(
-            base_hidden=base_hidden, lm_head_weight=self.lm_head_weight
+        draft_logits, candidate_ids, belief, s_t1 = self.draft_head(
+            base_hidden=base_hidden,
+            attention_mask=attention_mask,
         )
+
         candidate_embeds = self.base_model.get_input_embeddings()(candidate_ids)
+        
         fused_latent = self.fusion(
             candidate_embeddings=candidate_embeds,
-            belief=belief,
+            s_t1=s_t1,
             history_hidden=base_hidden,
         )
         fusion_logits, _ = self.head2(
             fused_latent=fused_latent,
             history_hidden=base_hidden,
-            lm_head_weight=self.lm_head_weight,
             attention_mask=attention_mask,
         )
 
@@ -253,19 +153,20 @@ class DualDecoderModel(nn.Module):
             base_logits = base_out.logits[:, -1, :]
             base_probs = F.softmax(base_logits / max(temperature, 1e-4), dim=-1)
 
-            draft_logits, candidate_ids, belief = self.draft_head(
-                base_hidden=base_hidden, lm_head_weight=self.lm_head_weight
+            draft_logits, candidate_ids, belief, s_t1 = self.draft_head(
+                base_hidden=base_hidden,
+                attention_mask=attention_mask,
             )
+            
             candidate_embeds = self.base_model.get_input_embeddings()(candidate_ids)
             fused_latent = self.fusion(
                 candidate_embeddings=candidate_embeds,
-                belief=belief,
+                s_t1=s_t1,
                 history_hidden=base_hidden,
             )
             fusion_logits, _ = self.head2(
                 fused_latent=fused_latent,
-                history_hidden=base_hidden,
-                lm_head_weight=self.lm_head_weight,
+                history_hidden=base_hidden,               
                 attention_mask=attention_mask,
             )
             fusion_probs = F.softmax(fusion_logits / max(temperature, 1e-4), dim=-1)

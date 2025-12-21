@@ -45,3 +45,4 @@ class DualDecoderConfig(PretrainedConfig):
         self.fusion_loss_weight = fusion_loss_weight
         self.acceptance_threshold = acceptance_threshold
         self.max_speculative_steps = max_speculative_steps
+        

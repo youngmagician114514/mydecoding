@@ -1,13 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "mydecoding"
 version = "0.1.0"
-description = "Belief-fused speculative decoding on Llama-3B (Hydra-inspired)"
-requires-python = ">=3.9"
+description = "Belief-fused speculative decoding"
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.1.0",
-    "transformers>=4.40.0",
+  "torch",
+  "transformers",
+  "datasets",
 ]
 
-[build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mydecoding*"]
+
+[project.scripts]
+mydecoding-generate = "mydecoding.cli.generate:main"
