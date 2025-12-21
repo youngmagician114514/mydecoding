@@ -1,0 +1,2 @@
+from mydecoding.config.dual_decoder import DualDecoderConfig
+from mydecoding.models.dual_decoder import DualDecoderModel
