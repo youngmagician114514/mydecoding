@@ -1,0 +1,11 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# build metadata
+*.egg-info/
+dist/
+build/
+
+# VSCode
+.vscode/

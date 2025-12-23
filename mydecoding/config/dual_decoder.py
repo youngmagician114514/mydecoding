@@ -14,8 +14,9 @@ class DualDecoderConfig(PretrainedConfig):
 
     def __init__(
         self,
-        base_model_name_or_path: str = "meta-llama/Meta-Llama-3-8B",
+        base_model_name_or_path: str = "Qwen/Qwen2.5-3B",
         num_draft_candidates: int = 3,
+        max_speculative_steps: int = 2,
         draft_hidden_size: int = 1024,
         draft_num_layers: int = 2,
         fusion_hidden_size: int = 1024,
@@ -27,7 +28,6 @@ class DualDecoderConfig(PretrainedConfig):
         draft_loss_weight: float = 1.0,
         fusion_loss_weight: float = 1.0,
         acceptance_threshold: float = 0.05,
-        max_speculative_steps: int = 3,
         **kwargs,
     ):
         super().__init__(**kwargs)
