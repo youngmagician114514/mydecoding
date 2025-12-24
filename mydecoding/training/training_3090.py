@@ -29,7 +29,7 @@ def main():
     num_phases = 1 + config.max_speculative_steps  # phase1 + head2 steps
 
     # ===== data =====
-    SEQ_LEN = 512
+    SEQ_LEN = 256
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
     tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path, use_fast=True)
@@ -48,7 +48,12 @@ def main():
     model = DualDecoderModel(config).to(device)
     model.train()
 
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-4, betas=(0.9, 0.95), weight_decay=0.1)
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=2e-4,
+        betas=(0.9, 0.95),
+        weight_decay=0.1,
+    )
     grad_accum = 8  # effective batch = 8
 
     use_bf16 = torch.cuda.is_bf16_supported()
@@ -59,8 +64,13 @@ def main():
     opt.zero_grad(set_to_none=True)
 
     for batch in loader:
-        input_ids = batch["input_ids"].to(device, non_blocking=True).unsqueeze(0)      # (B,T)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True).unsqueeze(0)
+        # DataLoader 已经给了 batch 维度，这里不要再 unsqueeze 了
+        input_ids = batch["input_ids"].to(device, non_blocking=True)        # (B, T)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+
+        # 可选：第一次迭代打印一下，确认是 (B,T)
+        if step == 0:
+            print("input_ids shape:", input_ids.shape)
 
         with torch.autocast(device_type="cuda", dtype=autocast_dtype):
             out = model(
@@ -76,6 +86,10 @@ def main():
         else:
             loss.backward()
 
+        if step == 0:
+            torch.cuda.synchronize()
+            print("peak mem GB:", torch.cuda.max_memory_allocated() / 1024**3)
+
         if (step + 1) % grad_accum == 0:
             if scaler.is_enabled():
                 scaler.unscale_(opt)
@@ -90,7 +104,11 @@ def main():
 
         if step % 20 == 0:
             h2 = out.head2_loss.item() if out.head2_loss is not None else -1.0
-            print(f"step={step} loss={out.loss.item():.4f} h1={out.head1_loss.item():.4f} h2={h2:.4f} phases={num_phases} dtype={autocast_dtype}")
+            print(
+                f"step={step} loss={out.loss.item():.4f} "
+                f"h1={out.head1_loss.item():.4f} "
+                f"h2={h2:.4f} phases={num_phases} dtype={autocast_dtype}"
+            )
 
         step += 1
         if step >= 300:
