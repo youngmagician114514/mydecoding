@@ -97,7 +97,7 @@ class DualDecoderModel(nn.Module):
         self.config = config
 
         if base_model is None:
-            self.base_model = AutoModelForCausalLM.from_pretrained(config.base_model_name_or_path)
+            self.base_model = AutoModelForCausalLM.from_pretrained(config.base_model_name_or_path,torch_dtype=torch.bfloat16, )
         else:
             self.base_model = base_model
 
@@ -158,6 +158,7 @@ class DualDecoderModel(nn.Module):
         labels: Optional[torch.Tensor] = None,
         num_phases: Optional[int] = None,
         temperature: float = 1.0,
+        train_stage: str = "all",   # "head1" 或 "all"
     ) -> DualDecoderOutput:
         """
         Training (distillation) convention:
@@ -221,6 +222,32 @@ class DualDecoderModel(nn.Module):
         # head1 distill target: base logits at ctx_len-1 predicts token at ctx_len
         head1_loss = kl_to_teacher(head1_logits, base_logits_full[:, ctx_len - 1, :], temperature)
 
+        # ========== Stage A: 只训练 head1 的分支 ==========
+        if train_stage == "head1":
+            # 不展开 head2，自然也没有 head2_loss
+            total_loss = self.config.draft_loss_weight * head1_loss
+
+            # pack candidate_groups 成 tensor，和原来保持接口一致
+            max_k = max(g.shape[1] for g in candidate_groups)
+            padded = []
+            for g in candidate_groups:
+                if g.shape[1] < max_k:
+                    pad = torch.full((B, max_k - g.shape[1]), -1, device=g.device, dtype=g.dtype)
+                    padded.append(torch.cat([g, pad], dim=1))
+                else:
+                    padded.append(g)
+            candidate_groups_tensor = torch.stack(padded, dim=1)  # (B,1,max_k) 这里 K=1
+
+            return DualDecoderOutput(
+                loss=total_loss,
+                head1_loss=head1_loss,
+                head2_loss=None,
+                draft_logits=head1_logits,
+                fusion_logits=head1_logits,      # 暂时用 head1_logits 占位
+                candidate_ids=candidate_groups_tensor,
+                fused_latent=z1,
+            )
+        
         # --------------------------
         # Phase 2..K: head2 loop
         # input: z_{<=i}

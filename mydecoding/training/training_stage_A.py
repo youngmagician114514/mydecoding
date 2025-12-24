@@ -173,9 +173,13 @@ def main():
 
     # ===== 保存 checkpoint =====
     os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = "checkpoints/dual_decoder_stageA_head1.pt"
-    torch.save(model.state_dict(), ckpt_path)
-    print(f"[StageA] saved checkpoint to {ckpt_path}")
+    student_state = {
+        "head1": model.head1.state_dict(),
+    }
+    ckpt_path = "checkpoints/dual_decoder_stageA_head1_student.pt"
+    torch.save(student_state, ckpt_path)
+    print(f"[StageA] saved student-only checkpoint to {ckpt_path}")
+
 
     # ===== 画 loss 曲线并保存 =====
     os.makedirs("results", exist_ok=True)

@@ -9,3 +9,7 @@ build/
 
 # VSCode
 .vscode/
+
+*.txt
+*.pt
+*.png

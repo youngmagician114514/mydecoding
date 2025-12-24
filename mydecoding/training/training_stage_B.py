@@ -166,9 +166,15 @@ def main():
             break
 
     os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = "checkpoints/dual_decoder_stageB_fusion_head2.pt"
-    torch.save(model.state_dict(), ckpt_path)
-    print(f"[StageB] saved checkpoint to {ckpt_path}")
+    student_state = {
+        "head1": model.head1.state_dict(),
+        "fusion": model.fusion.state_dict(),
+        "head2": model.head2.state_dict(),
+    }
+    ckpt_path = "checkpoints/dual_decoder_stageB_student.pt"
+    torch.save(student_state, ckpt_path)
+    print(f"[StageB] saved student-only checkpoint to {ckpt_path}")
+
 
 
 if __name__ == "__main__":
