@@ -119,12 +119,12 @@ class DualDecoderModel(nn.Module):
 
         self.head1 = CandidateDraftHead(
             hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            hidden_proj=config.draft_hidden_size,
-            num_mlp_layers=config.draft_num_layers,
             num_candidates=config.num_draft_candidates,
             num_heads=head1_num_heads,
             dropout=getattr(config, "draft_dropout", 0.1),
+            base_lm_head=self.base_model.lm_head,
+            ffn_multiplier=4,  # 和 Qwen FFN 比例一致
+            num_mlp_layers=config.draft_num_layers,  # 可以设成 4，模仿 Hydra++
         )
 
         # Fusion

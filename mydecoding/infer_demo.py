@@ -1,14 +1,3 @@
-# mydecoding/mydecoding/infer_dual_decoder.py
-"""
-使用已经训练好的 dual-decoder 做推理（step-level 生成示例）：
-
-- 加载 tokenizer + DualDecoderModel
-- 加载 StageB 的 checkpoint
-- 给一个 prompt，迭代地生成 max_new_tokens 个 token
-- 每一步都通过 head1 + fusion + head2，取最后一 phase 的 top-1 作为下一个 token
-  （这里为了简单，没有做和 base 的 accept/reject，只是用学生模型自己滚）
-"""
-
 import torch
 from transformers import AutoTokenizer
 
@@ -17,14 +6,18 @@ from mydecoding.models.dual_decoder import DualDecoderModel
 
 
 def load_model_and_tokenizer(
-    ckpt_path: str,
-    device: str = "cuda",
+    ckpt_path: str = "training/checkpoints/dual_decoder_stageB_student.pt",
 ):
-    # 配置要和训练时保持一致
+    """
+    加载 tokenizer + DualDecoderModel，并把 StageB 的 checkpoint 灌进去
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ===== 配置：要和训练时保持一致 =====
     config = DualDecoderConfig(
         base_model_name_or_path="Qwen/Qwen2.5-3B",
         num_draft_candidates=3,
-        max_speculative_steps=2,   # 你 StageB 训练用多少就填多少
+        max_speculative_steps=2,        # => 3 个 phase（1 个 head1 + 2 步 head2）
         draft_hidden_size=1024,
         draft_num_layers=2,
         fusion_hidden_size=1024,
@@ -35,6 +28,7 @@ def load_model_and_tokenizer(
         decoder_dropout=0.1,
         draft_loss_weight=1.0,
         fusion_loss_weight=1.0,
+        # acceptance_threshold 用默认的就行（config 里有默认值）
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -46,95 +40,142 @@ def load_model_and_tokenizer(
 
     model = DualDecoderModel(config)
     state = torch.load(ckpt_path, map_location="cpu")
+    # 严格匹配参数名
     model.load_state_dict(state, strict=False)
     model.to(device)
+    
+    # ★ 关键：统一 dtype，避免 BF16 / Float 混用
+    base_dtype = model.base_model.model.embed_tokens.weight.dtype
+    print("base_model dtype:", base_dtype)  # 调试用，可以删掉
+    model.to(dtype=base_dtype)
+    
+    
     model.eval()
 
-    return model, tokenizer, config
+    return model, tokenizer, device, config
 
 
-@torch.no_grad()
 def speculative_generate(
     model: DualDecoderModel,
-    tokenizer,
+    tokenizer: AutoTokenizer,
+    device: str,
     config: DualDecoderConfig,
     prompt: str,
-    max_new_tokens: int = 32,
-    temperature: float = 1.0,
-    device: str = "cuda",
+    max_new_tokens: int = 8,
 ):
-    # 编码 prompt
-    inputs = tokenizer(
+    """
+    使用 DualDecoderModel.generate 做一步一步的推理，并打印每一步：
+      - 最终决定的 token
+      - 每个 phase 的 top-k 候选（这里 k = 3）
+    """
+    # ===== 编码 prompt =====
+    enc = tokenizer(
         prompt,
         return_tensors="pt",
         padding=False,
         add_special_tokens=True,
     )
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
 
+    # 和训练时一样：phase 总数 = 1（head1） + max_speculative_steps（head2 步数）
     num_phases = 1 + int(config.max_speculative_steps)
 
-    use_bf16 = torch.cuda.is_bf16_supported()
-    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    gen_iter = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        num_phases=num_phases,
+        temperature=1.0,
+        acceptance_threshold=getattr(config, "acceptance_threshold", 0.05),
+    )
 
-    for step in range(max_new_tokens):
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                num_phases=num_phases,
-                temperature=temperature,
-            )
+    # 记录新生成的 token，最后一起 decode 出来
+    decided_token_ids = []
 
-        # out.candidate_ids 形状大致是 (B, num_phases, K)
-        cand_ids = out.candidate_ids  # (1, P, K)
-        # 取最后一个 phase 的 top-1 作为下一个 token
-        next_token_id = cand_ids[0, -1, 0].item()
+    for step, (decided_token, candidate_groups) in enumerate(gen_iter):
+        # decided_token: (B, 1)，我们只看 batch 0
+        decided_id = decided_token[0, 0].item()
+        decided_token_ids.append(decided_id)
+        decided_text = tokenizer.decode(
+            [decided_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
 
-        # 把新 token 接到序列后面
-        next_token = torch.tensor([[next_token_id]], device=device, dtype=input_ids.dtype)
-        input_ids = torch.cat([input_ids, next_token], dim=1)
-        # attention_mask 同步扩展
-        extra_mask = torch.ones_like(next_token, device=device)
-        attention_mask = torch.cat([attention_mask, extra_mask], dim=1)
+        print(f"\n[step {step}] decided token id = {decided_id}")
+        print(f"  decided token text: {repr(decided_text)}")
 
-    # 解码整个序列
-    output_text = tokenizer.decode(
+        # candidate_groups: List[Tensor]，长度 = phase 数
+        #   - candidate_groups[0] 是 head1 的 top-k
+        #   - candidate_groups[1], [2] 是 head2 不同 phase 的 top-k
+        for phase_idx, cand_tensor in enumerate(candidate_groups, start=1):
+            # cand_tensor 形状 (B, K)，取 batch 0 -> (K,)
+            cand_ids = cand_tensor[0]
+            cand_ids_list = cand_ids.tolist()
+            cand_texts = [
+                tokenizer.decode(
+                    [tid],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                for tid in cand_ids_list
+            ]
+
+            phase_name = "head1" if phase_idx == 1 else f"head2_phase{phase_idx-1}"
+            print(f"  {phase_name} candidates (phase {phase_idx}):")
+            for rank, (tid, txt) in enumerate(
+                zip(cand_ids_list, cand_texts), start=1
+            ):
+                print(f"    top{rank}: id={tid:<6} text={repr(txt)}")
+
+        # 如果生成到 eos，可以提前结束
+        if decided_id == tokenizer.eos_token_id:
+            break
+
+    # ===== 打印最终生成的完整文本 =====
+    if decided_token_ids:
+        new_text = tokenizer.decode(
+            decided_token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    else:
+        new_text = ""
+
+    full_text = tokenizer.decode(
         input_ids[0],
         skip_special_tokens=True,
-        clean_up_tokenization_spaces=True,
-    )
-    return output_text
+        clean_up_tokenization_spaces=False,
+    ) + new_text
+
+    print("\n=== 最终生成文本 ===")
+    print(full_text)
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt_path = "training/checkpoints/dual_decoder_stageB_fusion_head2.pt"
+    ckpt_path = "training/checkpoints/dual_decoder_stageB_student.pt"
+    model, tokenizer, device, config = load_model_and_tokenizer(ckpt_path)
 
-    print(f"loading model from {ckpt_path} ...")
-    model, tokenizer, config = load_model_and_tokenizer(ckpt_path, device=device)
+    print("loaded model, device:", device)
 
     while True:
         try:
-            prompt = input("\n输入一个 prompt（或直接回车退出）：\n> ").strip()
+            prompt = input("\n输入一个 prompt（或直接回车退出）：\n> ")
         except EOFError:
             break
 
-        if not prompt:
+        if not prompt.strip():
             break
 
-        text = speculative_generate(
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            prompt=prompt,
-            max_new_tokens=64,
-            temperature=1.0,
-            device=device,
+        speculative_generate(
+            model,
+            tokenizer,
+            device,
+            config,
+            prompt,
+            max_new_tokens=8,
         )
-        print("\n=== 生成结果 ===")
-        print(text)
 
 
 if __name__ == "__main__":

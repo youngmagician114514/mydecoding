@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 
 from mydecoding.config.dual_decoder import DualDecoderConfig
 from mydecoding.models.dual_decoder import DualDecoderModel
+from transformers import AutoTokenizer, AutoConfig  # 多导入 AutoConfig
 
 
 def make_dataloader(tokenizer, seq_len: int, batch_size: int) -> DataLoader:
@@ -57,7 +58,7 @@ def main():
         num_draft_candidates=3,
         max_speculative_steps=2,   # 你想多 phase 就改成 2，记得 T 要够长
         draft_hidden_size=1024,
-        draft_num_layers=2,
+        draft_num_layers=4,
         fusion_hidden_size=1024,
         fusion_num_heads=4,
         fusion_dropout=0.1,
@@ -71,6 +72,10 @@ def main():
     SEQ_LEN = 256
     BATCH_SIZE = 1
     GRAD_ACCUM = 8
+
+    base_cfg = AutoConfig.from_pretrained(config.base_model_name_or_path)
+    config.draft_hidden_size = base_cfg.hidden_size*4
+    config.fusion_hidden_size= base_cfg.hidden_size*4
 
     tokenizer = AutoTokenizer.from_pretrained(
         config.base_model_name_or_path,
