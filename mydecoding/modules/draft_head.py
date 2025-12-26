@@ -4,17 +4,27 @@ import torch.nn.functional as F
 from typing import Optional
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm (like Qwen/LLaMA)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., dim)
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return x / rms * self.weight
+
+
 class CandidateDraftHead(nn.Module):
-    """Hydra++ / Qwen-style draft head (head1).
+    """
+    Hydra++-aligned draft head:
 
-    1. 在 base_model 的最后隐状态 h_{1:t} 上再加一层 prefix self-attention decoder
-       （结构类似 Qwen block：多头注意力 + FFN），得到 s_{t+1}。
-
-    2. 再用一个小 MLP 把 s_{t+1} -> \tilde{h}_{t+1}（维度仍然是 hidden_size）。
-
-    3. 最后复用 *冻结的* base_model.lm_head 把 \tilde{h}_{t+1} 投到词表上。
-       这样 head1 的参数量主要来自 prefix decoder 和小 MLP，不再新建一个巨大的 vocab 线性层，
-       也更贴近 Hydra++ 的设计。
+    1) one extra *causal self-attention block* (prefix layer)
+    2) small MLP
+    3) RMSNorm
+    4) reuse frozen base lm_head
     """
 
     def __init__(
@@ -28,81 +38,89 @@ class CandidateDraftHead(nn.Module):
         num_mlp_layers: int = 4,
     ):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.num_candidates = num_candidates
 
-        # 1) prefix self-attention decoder layer
-        self.prefix_decoder_layer = nn.TransformerDecoderLayer(
+        # ✅ Prefix layer: causal self-attention only (NO cross-attn)
+        enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=hidden_size * ffn_multiplier,
             dropout=dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,   # 更接近现代 decoder block 行为（PreNorm）
         )
-        self.prefix_decoder = nn.TransformerDecoder(
-            self.prefix_decoder_layer,
-            num_layers=1,
-        )
+        self.prefix = nn.TransformerEncoder(enc_layer, num_layers=1)
 
-        # 2) small MLP: hidden_size -> ... -> hidden_size
+        # ✅ MLP: H -> (H*ffn)*... -> H
         mlp_layers = []
         in_dim = hidden_size
-        hidden_dim = hidden_size * ffn_multiplier
+        mid_dim = hidden_size * ffn_multiplier
         for _ in range(num_mlp_layers - 1):
-            mlp_layers.append(nn.Linear(in_dim, hidden_dim))
+            mlp_layers.append(nn.Linear(in_dim, mid_dim))
             mlp_layers.append(nn.GELU())
             mlp_layers.append(nn.Dropout(dropout))
-            in_dim = hidden_dim
-        mlp_layers.append(nn.Linear(in_dim, hidden_size))
+            in_dim = mid_dim
+        last = nn.Linear(in_dim, hidden_size)
+        mlp_layers.append(last)
         self.mlp = nn.Sequential(*mlp_layers)
 
-        # 3) reuse frozen base lm_head (hidden_size -> vocab)
+        # ✅ 关键稳定技巧：最后一层初始化为 0，让一开始 head 不会把 hidden 拉飞
+        nn.init.zeros_(last.weight)
+        if last.bias is not None:
+            nn.init.zeros_(last.bias)
+
+        # ✅ RMSNorm before lm_head (对齐 base hidden 分布)
+        self.out_norm = RMSNorm(hidden_size)
+
+        # ✅ reuse frozen base lm_head
         self.lm_head = base_lm_head
         for p in self.lm_head.parameters():
             p.requires_grad = False
-
-        self.num_candidates = num_candidates
 
     def forward(
         self,
         base_hidden: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        # base_hidden: (B, T, H)
+        """
+        base_hidden: (B, T, H)  last layer hidden from base model (ctx only)
+        attention_mask: (B, T)  1=valid, 0=pad
+        """
         B, T, H = base_hidden.shape
+        assert H == self.hidden_size
 
-        tgt = base_hidden
-        memory = base_hidden
-
-        memory_key_padding_mask = None
-        if attention_mask is not None:
-            memory_key_padding_mask = (attention_mask == 0)  # (B, T) True=pad
-
-        # 因为我们用的是 TransformerDecoder，还是加一个 causal mask 保持自回归
-        tgt_mask = torch.triu(
+        # ✅ causal mask: True means masked
+        causal_mask = torch.triu(
             torch.ones(T, T, device=base_hidden.device, dtype=torch.bool),
             diagonal=1,
         )
 
-        decoded = self.prefix_decoder(
-            tgt=tgt,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
-        )  # (B, T, H)
+        src_key_padding_mask = None
+        if attention_mask is not None:
+            src_key_padding_mask = (attention_mask == 0)  # True=pad
 
-        # 取最后一个位置作为 s_{t+1}
-        s_t1 = decoded[:, -1, :]  # (B, H)
+        # ✅ prefix self-attn
+        h = self.prefix(
+            base_hidden,
+            mask=causal_mask,
+            src_key_padding_mask=src_key_padding_mask,
+        )  # (B,T,H)
 
-        # 小 MLP 调整成 \tilde{h}_{t+1}
-        h_tilde = self.mlp(s_t1)  # (B, H)
+        s_t1 = h[:, -1, :]  # (B,H)
 
-        # 通过 base 的 lm_head 得到对整个词表的 logits
-        draft_logits = self.lm_head(h_tilde)  # (B, V)
+        # ✅ MLP residual (非常重要：防止 collapse 到 uniform)
+        delta = self.mlp(s_t1)     # (B,H)
+        h_tilde = s_t1 + delta     # residual
+
+        # ✅ RMSNorm对齐
+        h_tilde = self.out_norm(h_tilde)
+
+        # ✅ logits
+        draft_logits = self.lm_head(h_tilde)  # (B,V)
 
         probs = F.softmax(draft_logits, dim=-1)
-        belief_values, candidate_ids = torch.topk(
-            probs, k=self.num_candidates, dim=-1
-        )  # (B, K)
+        belief_values, candidate_ids = torch.topk(probs, k=self.num_candidates, dim=-1)
 
-        # 返回的 state 用 h_tilde（也就是 head1 的“自己的隐藏状态”）
         return draft_logits, candidate_ids, belief_values, h_tilde

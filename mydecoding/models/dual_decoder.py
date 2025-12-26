@@ -27,6 +27,43 @@ def kl_to_teacher(
     return F.kl_div(student_logprob, teacher_prob, reduction="batchmean") * (T * T)
 
 
+def soft_ce_topk_to_teacher(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    topk: int = 10,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Soft CE on teacher topK only:
+      p = softmax(teacher/T) restricted to topK and renormalized
+      loss = - sum_{i in topK} p_i * log q_i   (q = softmax(student/T))
+    """
+    T = max(float(temperature), 1e-6)
+    # teacher probs
+    with torch.no_grad():
+        teacher_prob_full = F.softmax(teacher_logits / T, dim=-1)  # (B,V)
+        topv, topi = torch.topk(teacher_prob_full, k=topk, dim=-1)  # (B,K)
+        p = topv / topv.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # renorm (B,K)
+
+    # student logprob
+    student_logprob_full = F.log_softmax(student_logits / T, dim=-1)  # (B,V)
+    logq = torch.gather(student_logprob_full, dim=-1, index=topi)     # (B,K)
+
+    loss = -(p * logq).sum(dim=-1).mean()  # average over batch
+    return loss * (T * T)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return x / rms * self.weight
+
+
 class LatentARTransformerHead2(nn.Module):
     """
     Phase2..: Head2 / Decoder2
@@ -45,8 +82,12 @@ class LatentARTransformerHead2(nn.Module):
         num_layers: int,
         num_heads: int,
         dropout: float = 0.1,
+        base_lm_head: Optional[nn.Module] = None,
+        adapter_hidden_multiplier: int = 2,
     ):
         super().__init__()
+        assert base_lm_head is not None, "LatentARTransformerHead2 requires base_lm_head for shared projection."
+
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=num_heads,
@@ -54,9 +95,31 @@ class LatentARTransformerHead2(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.out_proj = nn.Linear(hidden_size, vocab_size, bias=False)
+
+        # ✅ adapter: latent-state -> base-hidden-like
+        mid = hidden_size * adapter_hidden_multiplier
+        self.adapter = nn.Sequential(
+            nn.Linear(hidden_size, mid, bias=True),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mid, hidden_size, bias=True),
+        )
+        # ✅ zero-init last layer for stability
+        nn.init.zeros_(self.adapter[-1].weight)
+        nn.init.zeros_(self.adapter[-1].bias)
+
+        self.out_norm = RMSNorm(hidden_size)
+
+        # ✅ shared lm_head (frozen)
+        self.lm_head = base_lm_head
+        for p in self.lm_head.parameters():
+            p.requires_grad = False
+
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
 
     def forward(self, z_prefix: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -70,10 +133,17 @@ class LatentARTransformerHead2(nn.Module):
             torch.ones(L, L, device=z_prefix.device, dtype=torch.bool),
             diagonal=1,
         )
+
         h = self.encoder(z_prefix, mask=causal_mask)  # (B, L, H)
         state = h[:, -1, :]                           # (B, H)
-        logits = self.out_proj(state)                 # (B, V)
-        return logits, state
+
+        # ✅ adapter refine + residual + RMSNorm
+        state2 = state + self.adapter(state)
+        state2 = self.out_norm(state2)
+
+        logits = self.lm_head(state2)                 # (B, V)
+        return logits, state2
+
 
 
 class DualDecoderModel(nn.Module):
@@ -142,6 +212,8 @@ class DualDecoderModel(nn.Module):
             num_layers=config.decoder_num_layers,
             num_heads=config.decoder_num_heads,
             dropout=config.decoder_dropout,
+            base_lm_head=self.base_model.lm_head,               # ✅共享
+            adapter_hidden_multiplier=2,
         )
 
         self.embedding = self.base_model.get_input_embeddings()
@@ -262,14 +334,12 @@ class DualDecoderModel(nn.Module):
             head2_logits, s_i = self.head2(z_prefix)  # (B,V), (B,H)
             last_head2_logits = head2_logits
 
-            # head2 candidates per your diagram: fixed top-3
-            Ck_ids, Ck_belief = self._topk_from_logits(head2_logits, k=3)
-
+            cand_k = int(getattr(self.config, "num_fusion_candidates", 10))
+            Ck_ids, Ck_belief = self._topk_from_logits(head2_logits, k=cand_k)
             candidate_groups.append(Ck_ids)
             belief_groups.append(Ck_belief)
             state_groups.append(s_i)
 
-            # fusion -> z_{t+phase_idx}
             Ck_emb = self.embedding(Ck_ids)  # (B,3,H)
             z_next = self.fusion(
                 candidate_embeddings=Ck_emb,
@@ -280,10 +350,28 @@ class DualDecoderModel(nn.Module):
             latent_list.append(z_next)
             z_prefix = torch.cat([z_prefix, z_next.unsqueeze(1)], dim=1)
 
-            # distill to teacher base distribution
+            # ---- teacher alignment ----
             teacher_pos = (ctx_len - 1) + (phase_idx - 1)
             teacher_pos = min(teacher_pos, T - 1)
-            head2_losses.append(kl_to_teacher(head2_logits, base_logits_full[:, teacher_pos, :], temperature))
+            teacher_logits = base_logits_full[:, teacher_pos, :]
+
+            # ---- loss: topK soft CE + weighted KL ----
+            topk_ce = soft_ce_topk_to_teacher(
+                student_logits=head2_logits,
+                teacher_logits=teacher_logits,
+                topk=getattr(self.config, "head2_teacher_topk", 10),
+                temperature=temperature,
+            )
+            kl = kl_to_teacher(
+                student_logits=head2_logits,
+                teacher_logits=teacher_logits,
+                temperature=temperature,
+            )
+            w_ce = float(getattr(self.config, "head2_soft_ce_weight", 1.0))
+            w_kl = float(getattr(self.config, "head2_kl_weight", 0.3))
+
+            head2_losses.append(w_ce * topk_ce + w_kl * kl)
+
 
         head2_loss = torch.stack(head2_losses).mean() if len(head2_losses) > 0 else None
 
@@ -310,6 +398,7 @@ class DualDecoderModel(nn.Module):
             fusion_logits=last_head2_logits if last_head2_logits is not None else head1_logits,
             candidate_ids=candidate_groups_tensor,  # now contains per-phase candidate groups
             fused_latent=z1,
+            head2_logits=last_head2_logits,
         )
 
     @torch.no_grad()

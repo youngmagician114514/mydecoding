@@ -22,6 +22,7 @@ class DualDecoderConfig(PretrainedConfig):
         fusion_hidden_size: int = 1024,
         fusion_num_heads: int = 4,
         fusion_dropout: float = 0.1,
+        num_fusion_candidates: int = 10,
         decoder_num_layers: int = 2,
         decoder_num_heads: int = 8,
         decoder_dropout: float = 0.1,
@@ -35,6 +36,7 @@ class DualDecoderConfig(PretrainedConfig):
         self.num_draft_candidates = num_draft_candidates
         self.draft_hidden_size = draft_hidden_size
         self.draft_num_layers = draft_num_layers
+        self.num_fusion_candidates=num_fusion_candidates
         self.fusion_hidden_size = fusion_hidden_size
         self.fusion_num_heads = fusion_num_heads
         self.fusion_dropout = fusion_dropout
@@ -45,4 +47,5 @@ class DualDecoderConfig(PretrainedConfig):
         self.fusion_loss_weight = fusion_loss_weight
         self.acceptance_threshold = acceptance_threshold
         self.max_speculative_steps = max_speculative_steps
+
         

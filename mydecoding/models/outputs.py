@@ -12,3 +12,4 @@ class DualDecoderOutput:
     fusion_logits: torch.Tensor
     candidate_ids: torch.Tensor
     fused_latent: torch.Tensor
+    head2_logits: torch.Tensor | None = None

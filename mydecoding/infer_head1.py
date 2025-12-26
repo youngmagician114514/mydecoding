@@ -15,7 +15,7 @@ from mydecoding.models.dual_decoder import DualDecoderModel
 
 
 def load_model_and_tokenizer(
-    ckpt_path: str = "training/checkpoints/dual_decoder_stageA_head1_student.pt",
+    ckpt_path: str = "training/checkpoints/stageA_head1_step5000.pt",
     device: str | None = None,
 ):
     if device is None:

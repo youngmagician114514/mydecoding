@@ -1,262 +1,326 @@
-# mydecoding/training/training_stage_A.py
-"""
-Stage A: 只训练 head1（decoder1/head1），采用多位置 distillation，
-让它尽量贴近 Hydra++ 单头 draft head 的效果。
-
-- base_model 冻结，只作为 teacher
-- 对每条序列随机采多个位置 t，截断到 x_{1:t}，让 head1 拟合 base 对 x_{t+1} 的分布
-- loss: KL(student || teacher) 与 Hydra++ 相同类型
-- 输出：仅保存 head1 的 checkpoint；画 20-step 平均 loss 曲线
-"""
-
 import os
 import random
 from collections import deque
 
 import torch
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.optim import AdamW
+from transformers import AutoTokenizer
 from datasets import load_dataset
 import matplotlib.pyplot as plt
 
-from transformers import AutoTokenizer, AutoConfig
-
-from mydecoding.config.dual_decoder import DualDecoderConfig
-from mydecoding.models.dual_decoder import DualDecoderModel
+from mydecoding.models.dual_decoder import DualDecoderModel, DualDecoderConfig
 
 
-def make_dataloader(tokenizer, seq_len: int, batch_size: int) -> DataLoader:
-    """用 wikitext-2 做 teacher 数据。"""
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-
-    def tok_fn(ex):
-        out = tokenizer(
-            ex["text"],
-            truncation=True,
-            max_length=seq_len,
-            padding="max_length",
-        )
-        return {
-            "input_ids": out["input_ids"],
-            "attention_mask": out["attention_mask"],
-        }
-
-    ds = ds.map(tok_fn, remove_columns=ds.column_names)
-    ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
-
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-    )
-    return loader
+# ===========================
+# Utils
+# ===========================
+def count_trainable_params(model: torch.nn.Module) -> float:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
 
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    # ===== base 配置，用它的 hidden_size 决定 head1 MLP 宽度 =====
-    base_name = "Qwen/Qwen2.5-3B"
-    base_cfg = AutoConfig.from_pretrained(base_name)
-    H = base_cfg.hidden_size            # 例如 2560
-    ffw = 4 * H                         # 和大模型 FFN 的中间宽度一致
-
-    # ===== DualDecoderConfig：head1 尽量像 Hydra++ 的 draft head =====
-    config = DualDecoderConfig(
-        base_model_name_or_path=base_name,
-        num_draft_candidates=3,          # head1 每步 top-k 草稿
-        max_speculative_steps=1,         # StageA 只训练 t+1，等价单步 Hydra++
-        draft_hidden_size=2560,           # head1 MLP 中间宽度
-        draft_num_layers=4,              # 你可以后面试 2/4/6 比较
-        fusion_hidden_size=ffw,          # StageA 不用 fusion，但先占位
-        fusion_num_heads=4,
-        fusion_dropout=0.1,
-        decoder_num_layers=2,            # head2 留给 StageB
-        decoder_num_heads=8,
-        decoder_dropout=0.1,
-        draft_loss_weight=1.0,
-        fusion_loss_weight=1.0,
-    )
-
-    SEQ_LEN = 256
-    BATCH_SIZE = 1          # 脚本里假定 batch=1，方便多位置截断
-    GRAD_ACCUM = 8
-    MAX_STEPS = 150000        # 有效 step 数（按“截断次数”算），你可以增大
-
-    # ===== tokenizer & data =====
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.base_model_name_or_path,
-        use_fast=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    loader = make_dataloader(tokenizer, SEQ_LEN, BATCH_SIZE)
-
-    # ===== model =====
-    model = DualDecoderModel(config).to(device)
-    model.train()
-
-    # 先全部冻结
+def freeze_all_but_head1(model: torch.nn.Module):
+    """
+    强制只训练 head1（CandidateDraftHead）相关参数。
+    其它：base_model / fusion / head2 / lm_head 都冻结。
+    """
     for p in model.parameters():
         p.requires_grad = False
 
-    # 只训练 head1
-    for p in model.head1.parameters():
-        p.requires_grad = True
+    # 只打开 head1
+    for name, p in model.named_parameters():
+        if name.startswith("head1."):
+            p.requires_grad = True
 
-    # 明确保证 base 模型和 head2 / fusion 都是冻结的
-    for p in model.base_model.parameters():
-        p.requires_grad = False
-    for p in model.fusion.parameters():
-        p.requires_grad = False
-    for p in model.head2.parameters():
-        p.requires_grad = False
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    print(f"[StageA] trainable params: {sum(p.numel() for p in trainable_params)/1e6:.1f} M")
+    # 再确认 base_model 冻结（以防万一）
+    if hasattr(model, "base_model"):
+        for p in model.base_model.parameters():
+            p.requires_grad = False
 
 
-    opt = torch.optim.AdamW(
-        trainable_params,
-        lr=2e-4,
-        betas=(0.9, 0.95),
-        weight_decay=0.1,
+def print_trainable_modules(model: torch.nn.Module, max_lines: int = 80):
+    print("[StageA] Trainable parameter names (first few):")
+    c = 0
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            print(f"  {n:<60s} {p.numel()/1e6:.6f} M")
+            c += 1
+            if c >= max_lines:
+                break
+    if c == 0:
+        print("  (none!)")
+
+
+def save_head1_ckpt(model: DualDecoderModel, optimizer, step: int, out_dir="checkpoints", tag=""):
+    os.makedirs(out_dir, exist_ok=True)
+    name = f"stageA_head1_step{step}{tag}.pt"
+    path = os.path.join(out_dir, name)
+
+    torch.save(
+        {
+            "step": step,
+            "head1_state_dict": model.head1.state_dict(),  # ✅只保存 head1
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": getattr(model, "config", None),
+        },
+        path,
+    )
+    print(f"[StageA] head1 ckpt saved: {path}")
+
+
+@torch.no_grad()
+def compute_teacher_logits(model: DualDecoderModel, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    """
+    给定 (B, T) 的 input_ids/attention_mask，返回 teacher logits:
+    teacher_logits = base_logits[:, -2, :] -> 预测最后一个 token（因为 logits[i] 预测 token[i+1]）
+    StageA 我们喂的是 [:t+1]，因此 teacher 的位置就是 t-1 == -2。
+    """
+    base_out = model.base_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    base_logits = base_out.logits  # (B, T, V)
+    teacher_logits = base_logits[:, -2, :]  # (B, V)
+    return teacher_logits
+
+
+@torch.no_grad()
+def compute_debug_metrics(student_logits: torch.Tensor, teacher_logits: torch.Tensor):
+    student_logits_f = student_logits.float()
+    teacher_logits_f = teacher_logits.float()
+
+    student_probs = torch.softmax(student_logits_f, dim=-1)
+
+    top1_prob = student_probs.max(dim=-1).values.mean().item()
+
+    teacher_top1 = teacher_logits_f.argmax(dim=-1)
+    student_top1 = student_logits_f.argmax(dim=-1)
+    match_rate = (teacher_top1 == student_top1).float().mean().item()
+
+    logits_abs_mean = student_logits_f.abs().mean().item()
+    logits_std = student_logits_f.std().item()
+
+    entropy = (-student_probs * student_probs.clamp_min(1e-12).log()).sum(dim=-1).mean().item()
+
+    return {
+        "top1_prob": top1_prob,
+        "match_rate": match_rate,
+        "logits_abs_mean": logits_abs_mean,
+        "logits_std": logits_std,
+        "entropy": entropy,
+    }
+
+
+# ===========================
+# Main
+# ===========================
+def main():
+    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[StageA] device={device}")
+
+    # ===========================
+    # 超参数
+    # ===========================
+    base_name = "Qwen/Qwen2.5-3B"
+
+    SEQ_LEN = 256
+    GRAD_ACCUM = 8
+    MAX_STEPS = 5000
+
+    NUM_T_PER_SAMPLE = 4
+    MIN_T = 32
+
+    LR = 2e-4
+    WEIGHT_DECAY = 0.01
+
+    # ✅温度：先调它（越小越尖）
+    TEMPERATURE = 0.7
+
+    LOG_INTERVAL = 50
+    SAVE_INTERVAL = 500
+    PLOT_WINDOW = 20
+
+    # bfloat16 默认即可（你现在也是这样跑）
+    autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    use_scaler = (device == "cuda" and autocast_dtype == torch.float16)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+    # ===========================
+    # config
+    # ===========================
+    config = DualDecoderConfig(
+        base_model_name_or_path=base_name,
+        num_draft_candidates=3,
+        max_speculative_steps=1,
+
+        # 这些字段不重要：dual_decoder.py 里会用 base_model.config.hidden_size 对齐 head1
+        draft_hidden_size=1024,
+        draft_num_layers=4,
+
+        fusion_hidden_size=1024,
+        fusion_num_heads=4,
+        fusion_dropout=0.0,
+
+        decoder_num_layers=2,
+        decoder_num_heads=8,
+        decoder_dropout=0.0,
     )
 
-    use_bf16 = torch.cuda.is_bf16_supported()
-    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(autocast_dtype == torch.float16))
-    
-    print("adamw finish")
-    num_phases = 1  # 只跑 phase1 => 只用 head1
-    global_step = 0  # 统计“有效 step 数”（每次截断算一个 step）
-    opt.zero_grad(set_to_none=True)
+    # ===========================
+    # tokenizer & dataset
+    # ===========================
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # ===== 20-step 平均 loss 统计 =====
-    window_size = 20
-    recent_losses = deque(maxlen=window_size)
-    avg_steps = []   # 记录画图用的 step（对应窗口末尾的 step 编号）
-    avg_losses = []  # 对应的 20-step 平均 loss
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
-    # 多位置 distillation 的每个样本采样次数
-    NUM_T_PER_SAMPLE = 4
+    def tokenize_fn(ex):
+        return tokenizer(
+            ex["text"],
+            truncation=True,
+            max_length=SEQ_LEN,
+            padding="max_length",
+        )
 
-    data_iter = iter(loader)
-    while global_step < MAX_STEPS:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            batch = next(data_iter)
+    tokenized = dataset.map(tokenize_fn, batched=False, remove_columns=dataset.column_names)
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
-        # 这里假定 batch_size=1，方便处理长度
-        input_ids_full = batch["input_ids"].to(device, non_blocking=True)   # [1, L]
-        attn_mask_full = batch["attention_mask"].to(device, non_blocking=True)
+    # ===========================
+    # model
+    # ===========================
+    model = DualDecoderModel(config).to(device)
+    model.train()
 
-        # 真实长度（排除 pad）
+    freeze_all_but_head1(model)
+
+    trainable_m = count_trainable_params(model)
+    print(f"[StageA] trainable params: {trainable_m:.1f} M")
+    print_trainable_modules(model)
+
+    optimizer = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    # ===========================
+    # training loop
+    # ===========================
+    global_step = 0
+    loss_deque = deque(maxlen=PLOT_WINDOW)
+    avg_losses = []
+    avg_steps = []
+
+    idx = 0
+    while global_step < MAX_STEPS and idx < len(tokenized):
+        sample = tokenized[idx]
+        idx += 1
+
+        input_ids_full = sample["input_ids"].unsqueeze(0).to(device)        # (1, SEQ_LEN)
+        attn_mask_full = sample["attention_mask"].unsqueeze(0).to(device)   # (1, SEQ_LEN)
+
         seq_len = int(attn_mask_full.sum(dim=-1).item())
-        if seq_len <= 2:
-            continue  # 太短的不训练
-
-        # 可以采样的位置范围：t ∈ [min_t, seq_len-1]，预测的是 x_{t+1}
-        min_t = 4                      # 保证有点上下文
-        max_t = seq_len - 1
-        if max_t <= min_t:
+        if seq_len < (MIN_T + 1):
             continue
 
-        # 实际采样的 t 数量
-        num_t = min(NUM_T_PER_SAMPLE, max_t - min_t + 1)
+        # t ∈ [MIN_T, seq_len-1]，确保 t+1 <= seq_len
+        max_t = seq_len - 1
+        population = list(range(MIN_T, max_t + 1))
+        if not population:
+            continue
 
-        # 从 [min_t, max_t] 里随机采样不同的 t（长度）
-        ts = sorted(random.sample(range(min_t, max_t + 1), num_t))
+        num_t = min(NUM_T_PER_SAMPLE, len(population))
+        ts = sorted(random.sample(population, num_t))
 
         for t in ts:
             if global_step >= MAX_STEPS:
                 break
 
-            # 截断到前 t 个 token，当成新的序列 x_{1:t}
-            input_ids = input_ids_full[:, :t]
-            attention_mask = attn_mask_full[:, :t]
+            # ✅关键：必须包含 t+1
+            input_ids = input_ids_full[:, :t + 1]
+            attention_mask = attn_mask_full[:, :t + 1]
 
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            # teacher logits：base model next-token 分布
+            teacher_logits = compute_teacher_logits(model, input_ids, attention_mask)  # (B,V)
+
+            # forward + loss
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(device == "cuda")):
                 out = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    num_phases=num_phases,
-                    temperature=1.0,
+                    num_phases=1,
+                    temperature=TEMPERATURE,   # ✅温度调在这里
+                    train_stage="head1",
                 )
-                step_loss = out.head1_loss         # KL(student, teacher) @ 位置 t
+                step_loss = out.head1_loss
                 loss = step_loss / GRAD_ACCUM
 
-            # 记录原始 loss（不除 grad_accum）
-            loss_val = float(step_loss.item())
-            recent_losses.append(loss_val)
-
-            # backward & grad_accum
-            if scaler.is_enabled():
+            # backward
+            if use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            if (global_step + 1) % GRAD_ACCUM == 0:
-                if scaler.is_enabled():
-                    scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            loss_val = float(step_loss.item())
+            loss_deque.append(loss_val)
 
-                if scaler.is_enabled():
-                    scaler.step(opt)
+            # optimizer step (grad accum)
+            if (global_step + 1) % GRAD_ACCUM == 0:
+                if use_scaler:
+                    scaler.step(optimizer)
                     scaler.update()
                 else:
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            # debug logs
+            if global_step % LOG_INTERVAL == 0:
+                with torch.no_grad():
+                    metrics = compute_debug_metrics(out.draft_logits, teacher_logits)
+                print(
+                    f"[StageA][step {global_step}] "
+                    f"loss={loss_val:.4f} "
+                    f"top1_prob={metrics['top1_prob']:.6g} "
+                    f"match={metrics['match_rate']:.4f} "
+                    f"logits_abs_mean={metrics['logits_abs_mean']:.4f} "
+                    f"logits_std={metrics['logits_std']:.4f} "
+                    f"entropy={metrics['entropy']:.4f} "
+                    f"(T={TEMPERATURE}, t={t}, seq_len={seq_len})"
+                )
+
+            # # save ckpt (head1 only)
+            # if global_step > 0 and global_step % SAVE_INTERVAL == 0:
+            #     save_head1_ckpt(model, optimizer, global_step, out_dir="checkpoints")
+
+            # record avg loss curve
+            if len(loss_deque) == PLOT_WINDOW:
+                avg_losses.append(sum(loss_deque) / len(loss_deque))
+                avg_steps.append(global_step)
 
             global_step += 1
 
-            # 每到一个 step，就看 recent_losses 是否满 20，满了就算一个平均值
-            if len(recent_losses) == window_size:
-                avg_loss = sum(recent_losses) / window_size
-                avg_steps.append(global_step)
-                avg_losses.append(avg_loss)
+    # ✅训练结束：强制保存 last
+    save_head1_ckpt(model, optimizer, global_step, out_dir="checkpoints", tag="_last")
 
-            
-            # if global_step % 10 == 0:
-            #     print(
-            #         f"[StageA] step={global_step} "
-            #         f"h1={out.head1_loss.item():.4f} "
-            #     )
-            
-            # 控制台打印：每 100 个有效 step 打一次当前 20-step 平均
-            if global_step % 100 == 0 and len(recent_losses) > 0:
-                cur_avg = sum(recent_losses) / len(recent_losses)
-                print(f"[StageA] step={global_step}  "
-                      f"avg_loss(last {len(recent_losses)} steps)={cur_avg:.4f}")
-
-    # ===== 保存 checkpoint：只存 head1 =====
-    os.makedirs("checkpoints", exist_ok=True)
-    student_state = {
-        "head1": model.head1.state_dict(),
-    }
-    ckpt_path = "checkpoints/dual_decoder_stageA_head1_student.pt"
-    torch.save(student_state, ckpt_path)
-    print(f"[StageA] saved student-only checkpoint to {ckpt_path}")
-
-    # ===== 画 20-step 平均 loss 曲线 =====
-    os.makedirs("results", exist_ok=True)
-    if len(avg_steps) > 0:
-        plt.figure()
+    # plot loss curve
+    if len(avg_losses) > 0:
+        plt.figure(figsize=(7, 4))
         plt.plot(avg_steps, avg_losses)
-        plt.xlabel("step (effective, with multi-t)")
-        plt.ylabel("avg KL loss (window=20)")
-        plt.title("StageA head1 KL loss (20-step moving average)")
+        plt.xlabel("step")
+        plt.ylabel(f"avg head1 loss (window={PLOT_WINDOW})")
+        plt.title(f"StageA head1 distillation loss (T={TEMPERATURE})")
         plt.grid(True)
-        out_png = os.path.join("results", "stageA_head1_loss_avg20.png")
+        out_png = os.path.join("results", f"stageA_head1_loss_avg_T{str(TEMPERATURE).replace('.','p')}.png")
         plt.savefig(out_png, dpi=150, bbox_inches="tight")
-        print(f"[StageA] 20-step avg loss curve saved to {out_png}")
-    else:
-        print("[StageA] no avg loss recorded (too few steps?)")
+        print(f"[StageA] loss curve saved to {out_png}")
+
+    print("[StageA] done.")
 
 
 if __name__ == "__main__":
