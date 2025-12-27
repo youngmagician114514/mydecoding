@@ -240,7 +240,7 @@ def main():
     assert NUM_PHASES >= 2
 
     LOG_INTERVAL = 50
-    SAVE_INTERVAL = 20000
+    SAVE_INTERVAL = 5000
 
     # ✅有效长度最小约束：必须 >= NUM_PHASES + 1（否则 teacher 对齐会落在 PAD/越界）
     MIN_EFF_LEN = max(64, NUM_PHASES + 1)
@@ -324,6 +324,9 @@ def main():
     idx = 0
     N = len(tokenized)
     while global_step < MAX_STEPS:
+        if 2*global_step > MAX_STEPS:
+            NUM_PHASES = 3
+        
         sample = tokenized[idx % N]
         idx += 1
 
