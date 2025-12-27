@@ -358,6 +358,7 @@ def main():
                 num_phases=NUM_PHASES,
                 temperature=TEMPERATURE,
                 train_stage="head2",
+                teacher_mode="base_greedy",
             )
 
             # 优先用 head2_loss（如果你 forward 里返回），否则用 total_loss

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -223,6 +223,92 @@ class DualDecoderModel(nn.Module):
         vals, ids = torch.topk(probs, k=k, dim=-1)
         return ids, vals  # (B,k), (B,k)
 
+
+    @torch.no_grad()
+    def _base_greedy_rollout(
+        self,
+        input_ctx: torch.Tensor,
+        attn_ctx: Optional[torch.Tensor],
+        num_phases: int,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Base-model greedy rollout aligned to speculative setting.
+
+        Given a *context* x<=t (input_ctx), compute greedy tokens:
+        g1 = argmax P_base(. | x<=t)                 (token at t+1)
+        g2 = argmax P_base(. | x<=t, g1)             (token at t+2)
+        ...
+        gK = argmax P_base(. | x<=t, g1..g_{K-1})    (token at t+K)
+
+        Also return teacher logits for head2 phases:
+        teacher_head2_logits[i-2] = logits for token g_i, i=2..K
+        (i.e., distribution after feeding g_{i-1})
+
+        Returns dict with:
+        base_next_logits: (B,V)         logits for g1 distribution
+        base_greedy_tokens: (B,K)       [g1..gK]
+        teacher_head2_logits: (B,K-1,V) logits for g2..gK
+        """
+        device = input_ctx.device
+        B, ctx_len = input_ctx.shape
+        K = max(int(num_phases), 1)
+
+        # Ensure attention mask exists
+        if attn_ctx is None:
+            attn = torch.ones((B, ctx_len), device=device, dtype=torch.long)
+        else:
+            attn = attn_ctx.to(device)
+
+        # Prefill on context
+        out = self.base_model(
+            input_ids=input_ctx,
+            attention_mask=attn,
+            use_cache=True,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        past = out.past_key_values
+        base_next_logits = out.logits[:, -1, :]  # (B,V) for g1
+        g1 = torch.argmax(base_next_logits, dim=-1, keepdim=True)  # (B,1)
+
+        greedy_tokens = [g1]         # g1..gK (B,1) tensors
+        teacher_logits_list = []     # logits for g2..gK
+
+        cur = g1
+        cur_attn = attn
+
+        # Rollout remaining phases to get g2..gK
+        for _step in range(2, K + 1):
+            one = torch.ones((B, 1), device=device, dtype=cur_attn.dtype)
+            cur_attn = torch.cat([cur_attn, one], dim=1)
+
+            step_out = self.base_model(
+                input_ids=cur,
+                attention_mask=cur_attn,
+                past_key_values=past,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            past = step_out.past_key_values
+            logits = step_out.logits[:, -1, :]  # dist for next token g_i
+            teacher_logits_list.append(logits)
+            g = torch.argmax(logits, dim=-1, keepdim=True)
+            greedy_tokens.append(g)
+            cur = g
+
+        base_greedy_tokens = torch.cat(greedy_tokens, dim=1)  # (B,K)
+        teacher_head2_logits = (
+            torch.stack(teacher_logits_list, dim=1)
+            if len(teacher_logits_list) > 0
+            else torch.empty((B, 0, base_next_logits.shape[-1]), device=device, dtype=base_next_logits.dtype)
+        )
+        return {
+            "base_next_logits": base_next_logits,
+            "base_greedy_tokens": base_greedy_tokens,
+            "teacher_head2_logits": teacher_head2_logits,
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -231,56 +317,86 @@ class DualDecoderModel(nn.Module):
         num_phases: Optional[int] = None,
         temperature: float = 1.0,
         train_stage: str = "all",   # "head1" 或 "all"
-        infer_mode: bool = False,  # True: 推理/评估模式(不假设 input_ids 包含 future tokens，不计算 teacher loss)
+        infer_mode: bool = False,   # True: 只用 prefix，不依赖 future tokens，不回传 loss
+        teacher_mode: str = "teacher_forced",  # "teacher_forced" | "base_greedy"
     ) -> DualDecoderOutput:
         """
-        Training (distillation) convention:
-          - total phases = phase1(head1) + phase2..(head2 steps)
-          - if num_phases is None: num_phases = 1 + config.max_speculative_steps
-          - We assume input_ids contains enough future tokens for teacher logits.
+        Phase definitions (num_phases=K):
+        phase1: head1 predicts token at t+1 (candidate set C1)
+        phase2..K: head2 autoregresses over latent z_{<=i} to predict token at t+i (candidate sets C2..CK)
 
-        We split:
-          context length = T - K, where K = num_phases
-          phase1 aligns with base logits at position (ctx_len-1)
-          phase j aligns with base logits at position (ctx_len-1 + (j-1))
+        teacher_mode:
+        - teacher_forced: use base_model logits aligned to *gold* future tokens in input_ids (training-only).
+        - base_greedy:    use base_model greedy rollout:
+                g1 = argmax P_base(.|x<=t)
+                g2 = argmax P_base(.|x<=t,g1)
+                ...
+            and distill head2 to P_base(.|x<=t,g1..g_{i-1}).
+
+        Key guarantee for analysis/eval:
+        When K=3, a **single forward** returns:
+            head1_logits (phase1),
+            head2_logits_all[:,0] (phase2),
+            head2_logits_all[:,1] (phase3),
+        plus corresponding candidate groups in candidate_ids[:,phase,:].
         """
         if num_phases is None:
             num_phases = 1 + int(self.config.max_speculative_steps)
-        num_phases = max(int(num_phases), 1)
+        K = max(int(num_phases), 1)
 
-        B, T = input_ids.shape
-        K = num_phases
+        B, T_full = input_ids.shape
 
+        # -------------------------
+        # Determine context / split
+        # -------------------------
         if infer_mode:
-            # 推理/评估：input_ids 仅包含真实上下文，不包含 future tokens
-            # ctx_len 直接等于 T；不做 T-K 截断
-            ctx_len = T
+            # input_ids is prefix-only: x<=t
+            ctx_len = T_full
             input_ctx = input_ids
             attn_ctx = attention_mask if attention_mask is not None else None
         else:
-            # 训练/蒸馏：input_ids 末尾包含 K 个 future tokens，用于对齐 teacher logits
-            if T < K + 1:
-                # not enough tokens to distill multiple phases -> fall back to 1 phase
+            # training: input_ids ends with K future tokens for teacher-forced alignment
+            if T_full < K + 1:
                 K = 1
-
-            # context / future split for teacher
-            ctx_len = T - K
+            ctx_len = T_full - K
             input_ctx = input_ids[:, :ctx_len]
             attn_ctx = attention_mask[:, :ctx_len] if attention_mask is not None else None
 
-        # base teacher on full sequence
+        # -------------------------
+        # Base forward (for fusion history)
+        # -------------------------
+        # For base_greedy we only need prefix; for teacher_forced we need full sequence logits.
+        base_input_ids = input_ctx if (infer_mode or teacher_mode == "base_greedy") else input_ids
+        base_attn = attn_ctx if (infer_mode or teacher_mode == "base_greedy") else attention_mask
+
         with torch.no_grad():
             base_out = self.base_model(
-                input_ids=input_ctx if infer_mode else input_ids,
-                attention_mask=attn_ctx if infer_mode else attention_mask,
+                input_ids=base_input_ids,
+                attention_mask=base_attn,
                 output_hidden_states=True,
-                use_cache=False,
+                use_cache=(teacher_mode == "base_greedy"),
+                return_dict=True,
             )
-        base_hidden_full = base_out.hidden_states[-1]  # (B,T,H)
-        base_logits_full = base_out.logits             # (B,T,V)
+        base_hidden_full = base_out.hidden_states[-1]  # (B, T_base, H)
+        base_logits_full = base_out.logits             # (B, T_base, V)
 
         # base history for fusion conditioning (h_{<=t})
         base_hidden_ctx = base_hidden_full[:, :ctx_len, :]  # (B,ctx_len,H)
+
+        # -------------------------
+        # Optional base-greedy teacher rollout
+        # -------------------------
+        base_next_logits = None
+        base_greedy_tokens = None
+        teacher_head2_logits = None
+
+        if teacher_mode == "base_greedy":
+            rollout = self._base_greedy_rollout(input_ctx=input_ctx, attn_ctx=attn_ctx, num_phases=K)
+            base_next_logits = rollout["base_next_logits"]             # (B,V)
+            base_greedy_tokens = rollout["base_greedy_tokens"]         # (B,K)  tokens g1..gK
+            teacher_head2_logits = rollout["teacher_head2_logits"]     # (B,K-1,V) for g2..gK
+        else:
+            base_next_logits = base_logits_full[:, ctx_len - 1, :]
 
         # --------------------------
         # Phase 1: head1 -> C_{t+1}
@@ -295,21 +411,20 @@ class DualDecoderModel(nn.Module):
             history_hidden=base_hidden_ctx,
         )  # (B,H)
 
-        # collect groups (each phase one group)
-        candidate_groups: List[torch.Tensor] = [C1_ids]       # phase1 group
+        # collect groups
+        candidate_groups: List[torch.Tensor] = [C1_ids]
         belief_groups: List[torch.Tensor] = [C1_belief]
         state_groups: List[torch.Tensor] = [s1]
         latent_list: List[torch.Tensor] = [z1]
 
-        # head1 distill target: base logits at ctx_len-1 predicts token at ctx_len
-        head1_loss = None if infer_mode else kl_to_teacher(head1_logits, base_logits_full[:, ctx_len - 1, :], temperature)
+        head1_loss = None
+        if not infer_mode:
+            head1_loss = kl_to_teacher(head1_logits, base_next_logits, temperature)
 
-        # ========== Stage A: 只训练 head1 的分支 ==========
+        # ========== Stage A: only train head1 ==========
         if (not infer_mode) and train_stage == "head1":
-            # 不展开 head2，自然也没有 head2_loss
-            total_loss = None if infer_mode else (self.config.draft_loss_weight * head1_loss)
+            total_loss = self.config.draft_loss_weight * head1_loss
 
-            # pack candidate_groups 成 tensor，和原来保持接口一致
             max_k = max(g.shape[1] for g in candidate_groups)
             padded = []
             for g in candidate_groups:
@@ -318,24 +433,28 @@ class DualDecoderModel(nn.Module):
                     padded.append(torch.cat([g, pad], dim=1))
                 else:
                     padded.append(g)
-            candidate_groups_tensor = torch.stack(padded, dim=1)  # (B,1,max_k) 这里 K=1
+            candidate_groups_tensor = torch.stack(padded, dim=1)  # (B,1,max_k)
 
             return DualDecoderOutput(
                 loss=total_loss,
                 head1_loss=head1_loss,
                 head2_loss=None,
                 draft_logits=head1_logits,
-                fusion_logits=head1_logits,      # 暂时用 head1_logits 占位
+                fusion_logits=head1_logits,
                 candidate_ids=candidate_groups_tensor,
                 fused_latent=z1,
+                head2_logits=None,
+                head2_logits_all=None,
+                base_greedy_tokens=base_greedy_tokens,
+                teacher_head2_logits=teacher_head2_logits,
+                teacher_phase1_logits=base_next_logits,
             )
-        
+
         # --------------------------
-        # Phase 2..K: head2 loop
-        # input: z_{<=i}
-        # output: C_{t+i}, belief, s_{t+i}
+        # Phase 2..K: head2 loop (single forward produces all phase2..K logits)
         # --------------------------
         head2_losses: List[torch.Tensor] = []
+        head2_logits_list: List[torch.Tensor] = []
         last_head2_logits = None
 
         z_prefix = z1.unsqueeze(1)  # (B,1,H)
@@ -343,6 +462,7 @@ class DualDecoderModel(nn.Module):
         for phase_idx in range(2, K + 1):
             head2_logits, s_i = self.head2(z_prefix)  # (B,V), (B,H)
             last_head2_logits = head2_logits
+            head2_logits_list.append(head2_logits)
 
             cand_k = int(getattr(self.config, "num_fusion_candidates", 10))
             Ck_ids, Ck_belief = self._topk_from_logits(head2_logits, k=cand_k)
@@ -350,47 +470,48 @@ class DualDecoderModel(nn.Module):
             belief_groups.append(Ck_belief)
             state_groups.append(s_i)
 
-            Ck_emb = self.embedding(Ck_ids)  # (B,3,H)
+            Ck_emb = self.embedding(Ck_ids)
             z_next = self.fusion(
                 candidate_embeddings=Ck_emb,
                 s_t1=s_i,
                 history_hidden=base_hidden_ctx,
-            )  # (B,H)
-
+            )
             latent_list.append(z_next)
             z_prefix = torch.cat([z_prefix, z_next.unsqueeze(1)], dim=1)
 
-            # ---- teacher alignment ----
-            teacher_pos = (ctx_len - 1) + (phase_idx - 1)
-            teacher_pos = min(teacher_pos, T - 1)
-            teacher_logits = base_logits_full[:, teacher_pos, :]
-
-            # ---- loss: topK soft CE + weighted KL ----
-            topk_ce = soft_ce_topk_to_teacher(
-                student_logits=head2_logits,
-                teacher_logits=teacher_logits,
-                topk=getattr(self.config, "head2_teacher_topk", 10),
-                temperature=temperature,
-            )
-            kl = kl_to_teacher(
-                student_logits=head2_logits,
-                teacher_logits=teacher_logits,
-                temperature=temperature,
-            )
-            w_ce = float(getattr(self.config, "head2_soft_ce_weight", 1.0))
-            w_kl = float(getattr(self.config, "head2_kl_weight", 0.3))
-
             if not infer_mode:
+                if teacher_mode == "base_greedy":
+                    teacher_logits = teacher_head2_logits[:, phase_idx - 2, :]
+                else:
+                    teacher_pos = (ctx_len - 1) + (phase_idx - 1)
+                    teacher_pos = min(teacher_pos, base_logits_full.shape[1] - 1)
+                    teacher_logits = base_logits_full[:, teacher_pos, :]
+
+                topk_ce = soft_ce_topk_to_teacher(
+                    student_logits=head2_logits,
+                    teacher_logits=teacher_logits,
+                    topk=getattr(self.config, "head2_teacher_topk", 10),
+                    temperature=temperature,
+                )
+                kl = kl_to_teacher(
+                    student_logits=head2_logits,
+                    teacher_logits=teacher_logits,
+                    temperature=temperature,
+                )
+                w_ce = float(getattr(self.config, "head2_soft_ce_weight", 1.0))
+                w_kl = float(getattr(self.config, "head2_kl_weight", 0.3))
                 head2_losses.append(w_ce * topk_ce + w_kl * kl)
 
+        head2_loss = None
+        if not infer_mode and len(head2_losses) > 0:
+            head2_loss = torch.stack(head2_losses).mean()
 
-        head2_loss = None if infer_mode else (torch.stack(head2_losses).mean() if len(head2_losses) > 0 else None)
+        total_loss = None
+        if not infer_mode:
+            total_loss = self.config.draft_loss_weight * head1_loss
+            if head2_loss is not None:
+                total_loss = total_loss + self.config.fusion_loss_weight * head2_loss
 
-        total_loss = None if infer_mode else (self.config.draft_loss_weight * head1_loss)
-        if (not infer_mode) and (head2_loss is not None):
-            total_loss = total_loss + self.config.fusion_loss_weight * head2_loss
-
-        # pack candidate groups into (B, K, max_k) tensor for backward compatibility
         max_k = max(g.shape[1] for g in candidate_groups)
         padded = []
         for g in candidate_groups:
@@ -401,16 +522,24 @@ class DualDecoderModel(nn.Module):
                 padded.append(g)
         candidate_groups_tensor = torch.stack(padded, dim=1)  # (B,K,max_k)
 
+        head2_logits_all = torch.stack(head2_logits_list, dim=1) if len(head2_logits_list) > 0 else None
+
         return DualDecoderOutput(
             loss=total_loss,
             head1_loss=head1_loss,
             head2_loss=head2_loss,
             draft_logits=head1_logits,
             fusion_logits=last_head2_logits if last_head2_logits is not None else head1_logits,
-            candidate_ids=candidate_groups_tensor,  # now contains per-phase candidate groups
+            candidate_ids=candidate_groups_tensor,
             fused_latent=z1,
             head2_logits=last_head2_logits,
+            head2_logits_all=head2_logits_all,
+            base_greedy_tokens=base_greedy_tokens,
+            teacher_head2_logits=teacher_head2_logits,
+            teacher_phase1_logits=base_next_logits,
         )
+
+
 
     @torch.no_grad()
     def generate(

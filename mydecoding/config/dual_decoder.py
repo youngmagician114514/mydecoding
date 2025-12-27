@@ -18,7 +18,7 @@ class DualDecoderConfig(PretrainedConfig):
         num_draft_candidates: int = 3,
         max_speculative_steps: int = 2,
         draft_hidden_size: int = 1024,
-        draft_num_layers: int = 2,
+        draft_num_layers: int = 4,
         fusion_hidden_size: int = 1024,
         fusion_num_heads: int = 4,
         fusion_dropout: float = 0.1,
