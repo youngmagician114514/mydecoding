@@ -136,6 +136,7 @@ def propose_layerwise_tree(
             num_phases=1,
             temperature=1.0,
             train_stage="head2",  # doesn't matter, but keep consistent
+            infer_mode = True,
         )
     logits1 = get_head1_logits(out1)[0].float()
     C1 = torch.topk(logits1, k=branch).indices.tolist()
@@ -148,6 +149,7 @@ def propose_layerwise_tree(
             num_phases=2,
             temperature=1.0,
             train_stage="head2",
+             infer_mode = True,
         )
     logits2 = get_head2_logits_phase(out2, phase=2)[0].float()
     C2 = torch.topk(logits2, k=branch).indices.tolist()
@@ -160,6 +162,7 @@ def propose_layerwise_tree(
             num_phases=3,
             temperature=1.0,
             train_stage="head2",
+            infer_mode = True,
         )
     logits3 = get_head2_logits_phase(out3, phase=3)[0].float()
     C3 = torch.topk(logits3, k=branch).indices.tolist()

@@ -231,6 +231,7 @@ class DualDecoderModel(nn.Module):
         num_phases: Optional[int] = None,
         temperature: float = 1.0,
         train_stage: str = "all",   # "head1" 或 "all"
+        infer_mode: bool = False,  # True: 推理/评估模式(不假设 input_ids 包含 future tokens，不计算 teacher loss)
     ) -> DualDecoderOutput:
         """
         Training (distillation) convention:
@@ -249,20 +250,29 @@ class DualDecoderModel(nn.Module):
 
         B, T = input_ids.shape
         K = num_phases
-        if T < K + 1:
-            # not enough tokens to distill multiple phases -> fall back to 1 phase
-            K = 1
 
-        # context / future split for teacher
-        ctx_len = T - K
-        input_ctx = input_ids[:, :ctx_len]
-        attn_ctx = attention_mask[:, :ctx_len] if attention_mask is not None else None
+        if infer_mode:
+            # 推理/评估：input_ids 仅包含真实上下文，不包含 future tokens
+            # ctx_len 直接等于 T；不做 T-K 截断
+            ctx_len = T
+            input_ctx = input_ids
+            attn_ctx = attention_mask if attention_mask is not None else None
+        else:
+            # 训练/蒸馏：input_ids 末尾包含 K 个 future tokens，用于对齐 teacher logits
+            if T < K + 1:
+                # not enough tokens to distill multiple phases -> fall back to 1 phase
+                K = 1
+
+            # context / future split for teacher
+            ctx_len = T - K
+            input_ctx = input_ids[:, :ctx_len]
+            attn_ctx = attention_mask[:, :ctx_len] if attention_mask is not None else None
 
         # base teacher on full sequence
         with torch.no_grad():
             base_out = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=input_ctx if infer_mode else input_ids,
+                attention_mask=attn_ctx if infer_mode else attention_mask,
                 output_hidden_states=True,
                 use_cache=False,
             )
@@ -292,12 +302,12 @@ class DualDecoderModel(nn.Module):
         latent_list: List[torch.Tensor] = [z1]
 
         # head1 distill target: base logits at ctx_len-1 predicts token at ctx_len
-        head1_loss = kl_to_teacher(head1_logits, base_logits_full[:, ctx_len - 1, :], temperature)
+        head1_loss = None if infer_mode else kl_to_teacher(head1_logits, base_logits_full[:, ctx_len - 1, :], temperature)
 
         # ========== Stage A: 只训练 head1 的分支 ==========
-        if train_stage == "head1":
+        if (not infer_mode) and train_stage == "head1":
             # 不展开 head2，自然也没有 head2_loss
-            total_loss = self.config.draft_loss_weight * head1_loss
+            total_loss = None if infer_mode else (self.config.draft_loss_weight * head1_loss)
 
             # pack candidate_groups 成 tensor，和原来保持接口一致
             max_k = max(g.shape[1] for g in candidate_groups)
@@ -370,13 +380,14 @@ class DualDecoderModel(nn.Module):
             w_ce = float(getattr(self.config, "head2_soft_ce_weight", 1.0))
             w_kl = float(getattr(self.config, "head2_kl_weight", 0.3))
 
-            head2_losses.append(w_ce * topk_ce + w_kl * kl)
+            if not infer_mode:
+                head2_losses.append(w_ce * topk_ce + w_kl * kl)
 
 
-        head2_loss = torch.stack(head2_losses).mean() if len(head2_losses) > 0 else None
+        head2_loss = None if infer_mode else (torch.stack(head2_losses).mean() if len(head2_losses) > 0 else None)
 
-        total_loss = self.config.draft_loss_weight * head1_loss
-        if head2_loss is not None:
+        total_loss = None if infer_mode else (self.config.draft_loss_weight * head1_loss)
+        if (not infer_mode) and (head2_loss is not None):
             total_loss = total_loss + self.config.fusion_loss_weight * head2_loss
 
         # pack candidate groups into (B, K, max_k) tensor for backward compatibility

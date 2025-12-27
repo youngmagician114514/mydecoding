@@ -122,6 +122,7 @@ def student_topk_for_phase(
             num_phases=phase,
             temperature=temperature,
             train_stage="head2",
+            infer_mode =True,
         )
 
     if phase == 1:
