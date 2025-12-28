@@ -116,7 +116,7 @@ def main():
     ap.add_argument("--num_phases", type=int, default=3, choices=[2, 3], help="2: phase1+phase2; 3: phase1+phase2+phase3")
     ap.add_argument("--student_temperature", type=float, default=1.0)
     ap.add_argument("--base_temperature", type=float, default=1.0)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=12)
     args = ap.parse_args()
 
     random.seed(args.seed)

@@ -96,6 +96,37 @@ def compute_phase_match_and_stats(
 
 
 
+
+@torch.no_grad()
+def compute_match_and_stats_from_teacher_logits(head2_logits, teacher_logits):
+    """
+    head2_logits:   (B,V) student
+    teacher_logits: (B,V) teacher distribution (e.g. base_greedy teacher_head2_logits)
+    """
+    student_top1 = head2_logits.argmax(dim=-1)
+    teacher_top1 = teacher_logits.argmax(dim=-1)
+    match = (student_top1 == teacher_top1).float().mean().item()
+
+    ps = torch.softmax(head2_logits.float(), dim=-1)
+    top1_prob = ps.max(dim=-1).values.mean().item()
+    entropy = (-ps * ps.clamp_min(1e-12).log()).sum(dim=-1).mean().item()
+    abs_mean = head2_logits.float().abs().mean().item()
+    std = head2_logits.float().std().item()
+
+    # teacher_prob(student_top1)（类似 eval_prefix_phases 的 base_prob(student_top1)）
+    teacher_ps = torch.softmax(teacher_logits.float(), dim=-1)
+    base_prob_student_top1 = teacher_ps.gather(1, student_top1.view(-1, 1)).mean().item()
+
+    return {
+        "match": match,
+        "top1_prob": top1_prob,
+        "entropy": entropy,
+        "abs_mean": abs_mean,
+        "std": std,
+        "base_prob_student_top1": base_prob_student_top1,
+    }
+
+
 def unfreeze_fusion_and_head2(model):
     # fusion
     if hasattr(model, "fusion") and model.fusion is not None:
@@ -228,10 +259,10 @@ def main():
     SEQ_LEN = 256
     BATCH_SIZE = 1
     GRAD_ACCUM = 8
-    MAX_STEPS = 20000
+    MAX_STEPS = 50000
 
     LR = 2e-4
-    WEIGHT_DECAY = 0.1
+    WEIGHT_DECAY = 0.01
     TEMPERATURE = 0.7
 
     # StageB: 训练多 phase
@@ -254,7 +285,7 @@ def main():
     # ===========================
     config = DualDecoderConfig(
         base_model_name_or_path=base_name,
-        num_draft_candidates=10,
+        num_draft_candidates=3,
         max_speculative_steps=MAX_SPEC_STEPS,
 
         draft_hidden_size=1024,
@@ -263,7 +294,7 @@ def main():
         fusion_hidden_size=1024,
         fusion_num_heads=4,
         fusion_dropout=0.0,
-        num_fuion_candidates=10,
+        num_fusion_candidates=3,
         
         decoder_num_layers=2,
         decoder_num_heads=8,
@@ -338,23 +369,32 @@ def main():
         # ✅关键：按有效长度裁剪，避免 teacher 对齐落在 PAD 上
         input_ids_full = input_ids_full[:, :eff_len]
         attn_full = attn_full[:, :eff_len]
-        T = eff_len
+        T_full = eff_len
 
-        # 再确保足够长：T >= NUM_PHASES + 1
-        if T < (NUM_PHASES + 1):
+        # 再确保足够长：T_full >= NUM_PHASES + 1
+        if T_full < (NUM_PHASES + 1):
             continue
 
-        # 训练时我们用 prefix = [: ctx_len + K] 这种方式让多 phase 有 teacher
-        # 你 dual_decoder.py 内部规则是：
-        #   ctx_len = T - K
-        #   head1 预测 pos=ctx_len-1 -> token at ctx_len
-        #   head2 phase2 预测 pos=ctx_len -> token at ctx_len+1
-        #   ...
-        # 所以这里直接把完整序列喂给 model，并指定 num_phases=NUM_PHASES
+        # ✅原因A修复：训练时随机采样 prefix 长度，使其与 eval_prefix_phase 的“base-driven prefix=t”口径一致
+        # DualDecoderModel.forward(train/infer_mode=False) 内部规则：
+        #   ctx_len = T_in - K
+        # 因此我们构造 T_in = ctx_len + K => ctx_len 恰好等于我们采样的 prefix 长度。
+        MIN_CTX_LEN = 32  # 可调大一些（比如 16/32），避免太短的 prefix 不稳定
+        max_ctx_len = T_full - NUM_PHASES
+        if max_ctx_len <= MIN_CTX_LEN:
+            continue
+
+        ctx_len = random.randint(MIN_CTX_LEN, max_ctx_len)  # prefix 长度（= dual_decoder 里的 ctx_len）
+        T_in = ctx_len + NUM_PHASES                         # 让 dual_decoder 内部 ctx_len = T_in - K = ctx_len
+
+        input_ids = input_ids_full[:, :T_in]
+        attn = attn_full[:, :T_in]
+        T = T_in  # 仅用于日志打印
+
         with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(device == "cuda")):
             out = model(
-                input_ids=input_ids_full,
-                attention_mask=attn_full,
+                input_ids=input_ids,
+                attention_mask=attn,
                 num_phases=NUM_PHASES,
                 temperature=TEMPERATURE,
                 train_stage="head2",
@@ -398,31 +438,37 @@ def main():
             model_dtype = next(model.parameters()).dtype
             with torch.autocast(device_type="cuda", dtype=model_dtype, enabled=(device == "cuda")):
                 out2 = model(
-                    input_ids=input_ids_full,
-                    attention_mask=attn_full,
+                    input_ids=input_ids,
+                    attention_mask=attn,
                     num_phases=2,
                     temperature=TEMPERATURE,
                     train_stage="head2",
+                    teacher_mode="base_greedy",
                 )
             logits_p2 = get_last_logits_from_output(out2)  # phase2 logits (B,V)
 
-            # phase2 teacher_pos:
-            # ctx_len = T - K, 这里 K=2
-            # teacher_pos = ctx_len - 1 + (2-1) = ctx_len
-            ctx_len_2 = T - 2
-            teacher_pos_2 = ctx_len_2
-            m2 = compute_phase_match_and_stats(model, input_ids_full, attn_full, logits_p2, teacher_pos_2)
+            # ✅base_greedy 下，正确的 teacher 是：
+            #   teacher_head2_logits[:,0,:] = P_base(. | x<=ctx_len, g1)
+            if out2.teacher_head2_logits is not None and out2.teacher_head2_logits.numel() > 0:
+                teacher_logits_p2 = out2.teacher_head2_logits[:, 0, :]  # (B,V) for g2
+                m2 = compute_match_and_stats_from_teacher_logits(logits_p2, teacher_logits_p2)
+            else:
+                # fallback（不推荐）：用 base_logits 在 teacher_pos 上近似，容易变成“GT 条件”口径
+                ctx_len_2 = T - 2
+                teacher_pos_2 = ctx_len_2
+                m2 = compute_phase_match_and_stats(model, input_ids, attn, logits_p2, teacher_pos_2)
 
             # 只有当你训练 phases>=3 时才算 phase3
             m3 = None
             if NUM_PHASES >= 3:
                 with torch.autocast(device_type="cuda", dtype=model_dtype, enabled=(device == "cuda")):
                     out3 = model(
-                        input_ids=input_ids_full,
-                        attention_mask=attn_full,
+                        input_ids=input_ids,
+                        attention_mask=attn,
                         num_phases=3,
                         temperature=TEMPERATURE,
                         train_stage="head2",
+                        teacher_mode="base_greedy",
                     )
                 logits_p3 = get_last_logits_from_output(out3)  # phase3 logits (B,V)
 
@@ -431,7 +477,7 @@ def main():
                 # teacher_pos = ctx_len - 1 + (3-1) = ctx_len + 1
                 ctx_len_3 = T - 3
                 teacher_pos_3 = ctx_len_3 + 1
-                m3 = compute_phase_match_and_stats(model, input_ids_full, attn_full, logits_p3, teacher_pos_3)
+                m3 = compute_phase_match_and_stats(model, input_ids, attn, logits_p3, teacher_pos_3)
 
             # ==========================
             # Print（分别输出 phase2/phase3）

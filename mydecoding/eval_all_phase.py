@@ -271,7 +271,7 @@ def main():
 
     # ========== 改成你的路径 ==========
     stageA_head1_ckpt = "training/checkpoints/stageA_head1_step5000_last.pt"
-    stageB_student_ckpt = "training/checkpoints/stageB_student_step100000_last.pt"
+    stageB_student_ckpt = "training/checkpoints/stageB_student_step5000_last.pt"
     # =================================
 
     base_name = "Qwen/Qwen2.5-3B"
