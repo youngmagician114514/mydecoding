@@ -49,7 +49,7 @@ class CandidateDraftHead(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,   # 更接近现代 decoder block 行为（PreNorm）
+            norm_first=True,   
         )
         self.prefix = nn.TransformerEncoder(enc_layer, num_layers=1)
 
@@ -66,14 +66,12 @@ class CandidateDraftHead(nn.Module):
         mlp_layers.append(last)
         self.mlp = nn.Sequential(*mlp_layers)
 
-        # ✅ 关键稳定技巧：最后一层初始化为 0，让一开始 head 不会把 hidden 拉飞
         nn.init.zeros_(last.weight)
         if last.bias is not None:
             nn.init.zeros_(last.bias)
 
         # ✅ RMSNorm before lm_head (对齐 base hidden 分布)
         self.out_norm = RMSNorm(hidden_size)
-
         # ✅ reuse frozen base lm_head
         self.lm_head = base_lm_head
         for p in self.lm_head.parameters():

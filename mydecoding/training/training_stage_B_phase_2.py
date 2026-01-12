@@ -328,7 +328,7 @@ def main():
     model.train()
 
     # ---- load stageA head1
-    stageA_ckpt_path = "checkpoints/stageA_head1_step5000_last.pt"  # <<< 改成你的 head1 ckpt
+    stageA_ckpt_path = "checkpoints/stageA_sharp_head1_step5000_last.pt"  # <<< 改成你的 head1 ckpt
     load_head1_ckpt_into_model(model, stageA_ckpt_path)
 
     # ---- freeze base + head1; train fusion + head2

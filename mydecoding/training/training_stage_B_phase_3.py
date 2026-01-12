@@ -263,7 +263,7 @@ def main():
         fusion_hidden_size=1024,
         fusion_num_heads=4,
         fusion_dropout=0.0,
-        num_fuion_candidates=10,
+        num_fusion_candidates=10,
         
         decoder_num_layers=2,
         decoder_num_heads=8,
