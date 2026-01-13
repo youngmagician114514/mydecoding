@@ -86,6 +86,10 @@ class CandidateDraftHead(nn.Module):
         base_hidden: (B, T, H)  last layer hidden from base model (ctx only)
         attention_mask: (B, T)  1=valid, 0=pad
         """
+        param_dtype = next(self.prefix.parameters()).dtype
+        if base_hidden.dtype != param_dtype:
+            base_hidden = base_hidden.to(param_dtype)
+            
         B, T, H = base_hidden.shape
         assert H == self.hidden_size
 
@@ -114,6 +118,12 @@ class CandidateDraftHead(nn.Module):
 
         # ✅ RMSNorm对齐
         h_tilde = self.out_norm(h_tilde)
+
+        lm_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", None)
+        if lm_dtype is None:
+            lm_dtype = next(self.lm_head.parameters()).dtype
+        if h_tilde.dtype != lm_dtype:
+            h_tilde = h_tilde.to(lm_dtype)
 
         # ✅ logits
         draft_logits = self.lm_head(h_tilde)  # (B,V)

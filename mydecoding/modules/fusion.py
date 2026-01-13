@@ -69,6 +69,14 @@ class BeliefFusion(nn.Module):
         Returns:
             z_{t+1}: (B, H)
         """
+        param_dtype = next(self.parameters()).dtype
+        if candidate_embeddings.dtype != param_dtype:
+            candidate_embeddings = candidate_embeddings.to(param_dtype)
+        if s_t1.dtype != param_dtype:
+            s_t1 = s_t1.to(param_dtype)
+        if history_hidden.dtype != param_dtype:
+            history_hidden = history_hidden.to(param_dtype)
+        
         # ---- Stage 2: candidate self-attention among K candidates ----
         attn_out, _ = self.self_attn(
             candidate_embeddings,

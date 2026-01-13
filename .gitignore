@@ -14,3 +14,5 @@ build/
 *.pt
 *.png
 *.out
+*.json
+*.jsonl
