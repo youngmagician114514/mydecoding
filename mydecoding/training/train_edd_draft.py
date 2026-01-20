@@ -238,20 +238,51 @@ def main():
             # 2) Random block length in [5,10]
             L = random.randint(args.block_len_min, args.block_len_max)
 
-            # 3) Dual-block KL loss
-            loss = edd.kl_loss_dual_block(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                teacher_logits=enc.teacher_logits,
-                enc_hidden=enc.enc_hidden,
-                block_len=L,
-            )
-
             optim.zero_grad(set_to_none=True)
-            loss.backward()
+
+            # 先算一遍总 weight（只依赖 attention_mask，不需要梯度）
+            B, T = input_ids.shape
+            total_weight = 0.0
+            for s in range(0, T, L):
+                e = min(s + L, T)
+                if s >= T - 1:
+                    break
+                cur_valid = attention_mask[:, s:e]
+                if e < T:
+                    nxt_valid = attention_mask[:, s+1:e+1]
+                    valid = (cur_valid * nxt_valid).float()
+                else:
+                    valid = cur_valid.float()
+                    valid[:, -1] = 0.0
+                total_weight += valid.sum().item()
+            total_weight = max(total_weight, 1.0)
+
+            # 逐 block backward：每个 block 的图用完就释放，不会攒爆显存
+            loss_value = 0.0
+            for s in range(0, T, L):
+                e = min(s + L, T)
+                if s >= T - 1:
+                    break
+
+                loss_sum, weight_sum = edd.loss_one_block(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    teacher_logits=enc.teacher_logits,
+                    enc_hidden=enc.enc_hidden,
+                    s=s, e=e,
+                    topk=32,
+                )
+
+                # 等价于 overall (sum loss_sum)/(sum weight_sum) 的梯度，因为分母与模型无关
+                (loss_sum / total_weight).backward()
+                loss_value += loss_sum.detach().item()
+
             torch.nn.utils.clip_grad_norm_(edd.parameters(), 1.0)
             optim.step()
             sched.step()
+
+            # 方便打印：归一化后的 loss
+            loss = torch.tensor(loss_value / total_weight, device=device)
 
             if global_step % 50 == 0:
                 print(f"epoch={epoch} step={global_step}/{total_steps} L={L} loss={loss.item():.6f}")
