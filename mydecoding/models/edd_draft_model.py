@@ -1,5 +1,17 @@
-# edd_draft_model.py
-# EDD draft model (only draft part; no tree/PCT)
+# edd_draft_model_masked.py
+# EDD draft model (draft only; no tree/PCT)
+# Faster dual-block training: single forward with dual-block attention mask (Figure 3(a) in ECNU-EDD).
+#
+# Key idea:
+#   Build a combined sequence of length 2T: [H_1..H_T, t_1..t_T] as inputs_embeds,
+#   then build a 4D additive attention mask that enforces:
+#     - hidden queries (H part): causal inside H only
+#     - token queries (T part): can attend to
+#         (i) hidden keys up to start of its block (jL)
+#         (ii) token keys inside its own block up to itself (causal inside block)
+#       and cannot attend to tokens from earlier blocks.
+#
+# Loss: KL(P_teacher || P_draft) over token positions only (the second half).
 
 from __future__ import annotations
 
@@ -15,15 +27,14 @@ from transformers import AutoModelForCausalLM
 
 @dataclass
 class EDDEncoding:
-    """Outputs from frozen target encoder."""
-    teacher_logits: torch.Tensor      # (B, T, V)
-    enc_hidden: torch.Tensor          # (B, T, H)
+    teacher_logits: torch.Tensor  # (B, T, V)
+    enc_hidden: torch.Tensor      # (B, T, H)
 
 
 class EDDDraftModel(nn.Module):
     def __init__(self, draft_lm: nn.Module):
         super().__init__()
-        self.draft_lm = draft_lm  # AutoModelForCausalLM
+        self.draft_lm = draft_lm
 
     @classmethod
     def from_target(
@@ -44,18 +55,18 @@ class EDDDraftModel(nn.Module):
         for p in target.parameters():
             p.requires_grad_(False)
 
-        # Build draft config: only 1 layer
+        # Draft config: same as target but 1 layer
         draft_cfg = copy.deepcopy(target.config)
         if hasattr(draft_cfg, "num_hidden_layers"):
             draft_cfg.num_hidden_layers = 1
         elif hasattr(draft_cfg, "n_layer"):
             draft_cfg.n_layer = 1
         else:
-            raise ValueError("Unknown config field for num layers; please adapt for your model family.")
+            raise ValueError("Unknown config field for num layers; adapt for your model family.")
 
         draft = AutoModelForCausalLM.from_config(draft_cfg, trust_remote_code=trust_remote_code)
 
-        # Init embeddings + lm_head from target
+        # Init: copy embeddings + lm_head
         with torch.no_grad():
             draft.get_input_embeddings().weight.copy_(target.get_input_embeddings().weight)
             if hasattr(draft, "lm_head") and hasattr(target, "lm_head"):
@@ -71,142 +82,148 @@ class EDDDraftModel(nn.Module):
         target_model: nn.Module,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        enc_layer_index: int = -1,
+        enc_layer_index: int = -4,
     ) -> EDDEncoding:
         out = target_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             use_cache=False,
-            return_dict=True,
         )
-        hidden_states = out.hidden_states
-        if hidden_states is None:
-            raise RuntimeError("Target model did not return hidden_states. Ensure output_hidden_states=True.")
-        enc_hidden = hidden_states[enc_layer_index]     # (B, T, H)
-        teacher_logits = out.logits                     # (B, T, V)
+        hs = out.hidden_states
+        if hs is None:
+            raise RuntimeError("Target did not return hidden_states; ensure output_hidden_states=True works.")
+        enc_hidden = hs[enc_layer_index]  # (B,T,H)
+        teacher_logits = out.logits       # (B,T,V)
         return EDDEncoding(teacher_logits=teacher_logits, enc_hidden=enc_hidden)
 
-    def loss_one_block(
-        self,
-        input_ids: torch.Tensor,          # (B, T)
-        attention_mask: torch.Tensor,     # (B, T)
-        teacher_logits: torch.Tensor,     # (B, T, V)
-        enc_hidden: torch.Tensor,         # (B, T, H)
-        s: int,
-        e: int,
-        topk: int = 32,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _dual_block_attn_bias(
+        attention_mask: torch.Tensor,  # (B,T) 1=valid
+        block_len: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         """
-        Compute (loss_sum, weight_sum) for a single block [s:e).
-        Return:
-          - loss_sum: scalar tensor w/ grad
-          - weight_sum: scalar tensor (no grad)
+        Return additive attention bias (B,1,S,S) where S=2T.
+        0 means allowed; -inf means masked.
+        """
+        device = attention_mask.device
+        B, T = attention_mask.shape
+        S = 2 * T
+        neg_inf = torch.finfo(dtype).min
+
+        # Build indices
+        idx = torch.arange(T, device=device)  # (T,)
+        block_id = idx // block_len
+        block_start = block_id * block_len  # (T,)
+
+        # Allowed for token queries:
+        # token query at i can attend to:
+        #   - hidden keys < block_start[i]
+        #   - token keys in same block AND <= i
+        #
+        # We'll build two boolean matrices (T,T):
+        #   allow_token_to_hidden[i,k] where i=query token idx, k=hidden idx
+        #   allow_token_to_token[i,k]  where i=query token idx, k=token idx
+        k = idx.view(1, T)  # (1,T)
+        i = idx.view(T, 1)  # (T,1)
+
+        allow_token_to_hidden = k < block_start.view(T, 1)  # (T,T)
+        allow_token_to_token = (block_id.view(T, 1) == block_id.view(1, T)) & (k <= i)  # same block, causal inside block
+
+        # Hidden queries: causal inside hidden
+        allow_hidden_to_hidden = k <= i  # (T,T)
+
+        # Compose full allow matrix for SxS (hidden+token)
+        allow = torch.zeros((S, S), device=device, dtype=torch.bool)
+
+        # hidden queries -> hidden keys
+        allow[:T, :T] = allow_hidden_to_hidden
+        # hidden queries -> token keys (disallow; already False)
+
+        # token queries -> hidden keys
+        allow[T:, :T] = allow_token_to_hidden
+        # token queries -> token keys
+        allow[T:, T:] = allow_token_to_token
+
+        # Key padding: both hidden and token positions share the same validity from attention_mask
+        valid_1 = attention_mask.to(torch.bool)                  # (B,T)
+        valid_2 = torch.cat([valid_1, valid_1], dim=1)           # (B,2T)
+
+        # Base bias from allow (same for all batch)
+        bias = torch.where(allow, torch.zeros((), device=device, dtype=dtype), torch.full((), neg_inf, device=device, dtype=dtype))
+        bias = bias.view(1, 1, S, S).expand(B, 1, S, S).contiguous()
+
+        # Mask out padded keys (for all queries)
+        # If a key position is invalid, set bias[..., :, key] = -inf
+        key_invalid = ~valid_2  # (B,S)
+        if key_invalid.any():
+            bias = bias.masked_fill(key_invalid.view(B, 1, 1, S), neg_inf)
+
+        # Avoid rows with all -inf (can create NaNs) for padded queries:
+        # For invalid queries, allow attending to key=0 (if it is valid; otherwise key=0 is also pad but we still force it).
+        query_invalid = ~valid_2  # (B,S)
+        if query_invalid.any():
+            bias[query_invalid.view(B, 1, S, 1).expand(B, 1, S, S)] = neg_inf
+            bias[query_invalid, 0, 0] = 0  # (advanced indexing) allow key 0
+
+        return bias
+
+    def kl_loss_dual_block_masked(
+        self,
+        input_ids: torch.Tensor,      # (B,T)
+        attention_mask: torch.Tensor, # (B,T)
+        teacher_logits: torch.Tensor, # (B,T,V)
+        enc_hidden: torch.Tensor,     # (B,T,H)
+        block_len: int,
+        topk: int = 32,
+    ) -> torch.Tensor:
+        """
+        Single-forward dual-block training:
+          1) inputs_embeds = concat([enc_hidden, embed(input_ids)])
+          2) pass 4D additive mask enforcing Figure-3(a) visibility
+          3) compute KL (approx via teacher-topk) on token half only
         """
         assert input_ids.dim() == 2
         B, T = input_ids.shape
         device = input_ids.device
 
-        if s >= T - 1:
-            # no next-token label
-            z = torch.zeros((), device=device, dtype=torch.float32)
-            return z, z + 1.0
+        tok_embeds = self.draft_lm.get_input_embeddings()(input_ids)  # (B,T,H)
+        inputs_embeds = torch.cat([enc_hidden, tok_embeds], dim=1)    # (B,2T,H)
 
-        prompt_len = s
-        tok_ids = input_ids[:, s:e]                 # (B, Lb)
-        tok_mask = attention_mask[:, s:e]           # (B, Lb)
+        # 4D attention bias
+        attn_bias = self._dual_block_attn_bias(attention_mask, block_len, dtype=inputs_embeds.dtype)
 
-        if prompt_len > 0:
-            prompt_embeds = enc_hidden[:, :prompt_len, :]    # (B, s, H)
-            prompt_mask = attention_mask[:, :prompt_len]     # (B, s)
-        else:
-            prompt_embeds = enc_hidden[:, :0, :]
-            prompt_mask = attention_mask[:, :0]
-
-        tok_embeds = self.draft_lm.get_input_embeddings()(tok_ids)  # (B, Lb, H)
-        inputs_embeds = torch.cat([prompt_embeds, tok_embeds], dim=1)  # (B, s+Lb, H)
-        attn_mask = torch.cat([prompt_mask, tok_mask], dim=1)          # (B, s+Lb)
-
-        # only run transformer body
-        base = getattr(self.draft_lm, "model", None) or getattr(self.draft_lm, "transformer", None)
-        if base is None:
-            raise RuntimeError("Cannot find base model module: expected draft_lm.model or draft_lm.transformer")
-
-        out = base(
+        # Run transformer body once (no lm_head inside model call to save some mem; we'll apply lm_head only to token half)
+        out = self.draft_lm.model(
             inputs_embeds=inputs_embeds,
-            attention_mask=attn_mask,
+            attention_mask=attn_bias,   # 4D additive mask
             use_cache=False,
             return_dict=True,
         )
-        hidden = out.last_hidden_state                      # (B, s+Lb, H)
-        hidden_block = hidden[:, prompt_len:, :]            # (B, Lb, H)
-        logits_block = self.draft_lm.lm_head(hidden_block)  # (B, Lb, V)
+        hidden = out.last_hidden_state           # (B,2T,H)
+        hidden_tok = hidden[:, T:, :]            # (B,T,H)
+        logits_tok = self.draft_lm.lm_head(hidden_tok)  # (B,T,V)
 
-        # teacher block: (B, Lb, V)  (still huge overall, but only slice is used here)
-        teacher_block = teacher_logits[:, s:e, :]
+        # Valid positions for next-token loss: need pos and pos+1 both valid, and pos <= T-2
+        cur_valid = attention_mask[:, :T]                       # (B,T)
+        nxt_valid = torch.zeros_like(cur_valid)
+        nxt_valid[:, :-1] = attention_mask[:, 1:]
+        valid = (cur_valid * nxt_valid).float()                 # (B,T)
+        valid[:, -1] = 0.0
 
-        # valid mask
-        cur_valid = attention_mask[:, s:e]  # (B, Lb)
-        if e < T:
-            nxt_valid = attention_mask[:, s + 1 : e + 1]    # (B, Lb)
-            valid = cur_valid * nxt_valid
-        else:
-            valid = cur_valid.clone()
-            valid[:, -1] = 0
+        # Top-k KL approx (cross-entropy on teacher topk support)
+        t_logits = teacher_logits.float()
+        s_logits = logits_tok.float()
 
-        # pos_has_label
-        pos = torch.arange(s, e, device=device)
-        pos_has_label = (pos < (T - 1)).view(1, -1).to(valid.dtype)
-        valid = valid * pos_has_label
-        weight = valid.float()
-        weight_sum = weight.sum().clamp_min(1.0)
+        t_topv, t_topi = torch.topk(t_logits, k=min(topk, t_logits.size(-1)), dim=-1)  # (B,T,K)
+        t_probs = F.softmax(t_topv, dim=-1)  # (B,T,K)
+        s_logp = F.log_softmax(s_logits, dim=-1).gather(-1, t_topi)  # (B,T,K)
+        ce = -(t_probs * s_logp).sum(dim=-1)  # (B,T)
 
-        # ---- topk distill WITHOUT full-vocab log_softmax ----
-        # topk over teacher in its native dtype (avoid teacher_block.float() full copy)
-        t_topv, t_topi = torch.topk(teacher_block, k=topk, dim=-1)   # (B, Lb, K)
-        t_probs = F.softmax(t_topv.float(), dim=-1)                  # (B, Lb, K) small
-
-        # student selected logits
-        s_sel = logits_block.gather(-1, t_topi)                      # (B, Lb, K)
-
-        # log P_s(i) = s_i - logsumexp(all_vocab)
-        denom = torch.logsumexp(logits_block.float(), dim=-1, keepdim=True)  # (B, Lb, 1)
-        s_logp = s_sel.float() - denom                                       # (B, Lb, K)
-
-        # CE over teacher topk support
-        ce = -(t_probs * s_logp).sum(dim=-1)                          # (B, Lb)
-
-        loss_sum = (ce * weight).sum()
-        return loss_sum, weight_sum
-
-    # keep for compatibility (still ok for debugging/small T, but NOT memory-friendly)
-    def kl_loss_dual_block(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        enc_hidden: torch.Tensor,
-        block_len: int,
-    ) -> torch.Tensor:
-        # NOTE: this version will keep graphs for all blocks, so it can OOM for long T.
-        B, T = input_ids.shape
-        device = input_ids.device
-        total_loss = torch.zeros((), device=device, dtype=torch.float32)
-        total_weight = torch.zeros((), device=device, dtype=torch.float32)
-
-        for s in range(0, T, block_len):
-            e = min(s + block_len, T)
-            loss_sum, weight_sum = self.loss_one_block(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                teacher_logits=teacher_logits,
-                enc_hidden=enc_hidden,
-                s=s, e=e,
-            )
-            total_loss = total_loss + loss_sum
-            total_weight = total_weight + weight_sum
-
-        return total_loss / total_weight.clamp_min(1.0)
+        loss_sum = (ce * valid).sum()
+        weight_sum = valid.sum().clamp_min(1.0)
+        return loss_sum / weight_sum
 
     def save_pretrained(self, output_dir: str):
         self.draft_lm.save_pretrained(output_dir)
