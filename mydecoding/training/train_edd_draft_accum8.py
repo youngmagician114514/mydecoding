@@ -129,7 +129,9 @@ def parse_args():
     p.add_argument("--block_len_min", type=int, default=5)
     p.add_argument("--block_len_max", type=int, default=10)
     p.add_argument("--enc_layer_index", type=int, default=-4)
-    p.add_argument("--topk", type=int, default=32)
+    p.add_argument("--kl_mode", type=str, default="full", choices=["full", "topk"])
+    p.add_argument("--topk", type=int, default=32, help="Only used when --kl_mode topk")
+    p.add_argument("--kl_chunk_size", type=int, default=4096, help="Only used when --kl_mode full")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--bf16", action="store_true")
@@ -244,7 +246,9 @@ def main():
                 teacher_logits=enc.teacher_logits,
                 enc_hidden=enc.enc_hidden,
                 block_len=L,
+                kl_mode=args.kl_mode,
                 topk=args.topk,
+                kl_chunk_size=args.kl_chunk_size,
             )
 
             (loss / args.grad_accum).backward()

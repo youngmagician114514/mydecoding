@@ -169,6 +169,39 @@ class EDDDraftModel(nn.Module):
 
         return bias
 
+    @staticmethod
+    def _kl_full_vocab_chunked(
+        teacher_logits: torch.Tensor,   # (B,T,V) float/half ok
+        student_logits: torch.Tensor,   # (B,T,V)
+        valid: torch.Tensor,            # (B,T) float 0/1
+        chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """Exact KL(Pt || Pd) computed in vocab chunks to reduce peak memory.
+        KL = sum_x p_t(x) * (log p_t(x) - log p_d(x)).
+        We avoid materializing full softmax by using logsumexp for denominators and chunked exp.
+        """
+        # (B,T)
+        logZ_t = torch.logsumexp(teacher_logits.float(), dim=-1)
+        logZ_s = torch.logsumexp(student_logits.float(), dim=-1)
+
+        B, T, V = teacher_logits.shape
+        kl_bt = torch.zeros((B, T), device=teacher_logits.device, dtype=torch.float32)
+
+        for v0 in range(0, V, chunk_size):
+            v1 = min(v0 + chunk_size, V)
+            t_chunk = teacher_logits[:, :, v0:v1].float()  # (B,T,C)
+            s_chunk = student_logits[:, :, v0:v1].float()  # (B,T,C)
+
+            logp_t = t_chunk - logZ_t.unsqueeze(-1)
+            logp_s = s_chunk - logZ_s.unsqueeze(-1)
+            p_t = torch.exp(logp_t)  # (B,T,C)
+
+            kl_bt += (p_t * (logp_t - logp_s)).sum(dim=-1)
+
+        loss_sum = (kl_bt * valid).sum()
+        weight_sum = valid.sum().clamp_min(1.0)
+        return loss_sum / weight_sum
+
     def kl_loss_dual_block_masked(
         self,
         input_ids: torch.Tensor,      # (B,T)
@@ -176,25 +209,31 @@ class EDDDraftModel(nn.Module):
         teacher_logits: torch.Tensor, # (B,T,V)
         enc_hidden: torch.Tensor,     # (B,T,H)
         block_len: int,
+        kl_mode: str = "topk",        # "topk" or "full"
         topk: int = 32,
+        kl_chunk_size: int = 4096,
     ) -> torch.Tensor:
         """
-        Single-forward dual-block training:
-          1) inputs_embeds = concat([enc_hidden, embed(input_ids)])
-          2) pass 4D additive mask enforcing Figure-3(a) visibility
-          3) compute KL (approx via teacher-topk) on token half only
+        Single-forward dual-block training (Eq.3 dual-block mask + KL loss Eq.4):
+
+        1) inputs_embeds = concat([enc_hidden, embed(input_ids)])   # length 2T
+        2) pass 4D additive mask enforcing Figure-3(a) visibility
+        3) compute KL(P_teacher || P_draft) on token half only
+
+        Note on KL:
+        - kl_mode="full": exact full-vocab KL via chunked computation (recommended for faithful paper reproduction).
+        - kl_mode="topk": teacher-topk approximation (faster/less compute but can hurt acceptance).
         """
         assert input_ids.dim() == 2
         B, T = input_ids.shape
-        device = input_ids.device
 
         tok_embeds = self.draft_lm.get_input_embeddings()(input_ids)  # (B,T,H)
         inputs_embeds = torch.cat([enc_hidden, tok_embeds], dim=1)    # (B,2T,H)
 
-        # 4D attention bias
+        # 4D attention bias (dual-block visibility)
         attn_bias = self._dual_block_attn_bias(attention_mask, block_len, dtype=inputs_embeds.dtype)
 
-        # Run transformer body once (no lm_head inside model call to save some mem; we'll apply lm_head only to token half)
+        # Run transformer body once; apply lm_head only to token half
         out = self.draft_lm.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attn_bias,   # 4D additive mask
@@ -212,13 +251,21 @@ class EDDDraftModel(nn.Module):
         valid = (cur_valid * nxt_valid).float()                 # (B,T)
         valid[:, -1] = 0.0
 
-        # Top-k KL approx (cross-entropy on teacher topk support)
+        if kl_mode == "full":
+            return self._kl_full_vocab_chunked(
+                teacher_logits=teacher_logits,
+                student_logits=logits_tok,
+                valid=valid,
+                chunk_size=kl_chunk_size,
+            )
+
+        # ---- top-k approx (teacher support only) ----
         t_logits = teacher_logits.float()
         s_logits = logits_tok.float()
 
         t_topv, t_topi = torch.topk(t_logits, k=min(topk, t_logits.size(-1)), dim=-1)  # (B,T,K)
-        t_probs = F.softmax(t_topv, dim=-1)  # (B,T,K)
-        s_logp = F.log_softmax(s_logits, dim=-1).gather(-1, t_topi)  # (B,T,K)
+        t_probs = torch.softmax(t_topv, dim=-1)  # (B,T,K)
+        s_logp = torch.log_softmax(s_logits, dim=-1).gather(-1, t_topi)  # (B,T,K)
         ce = -(t_probs * s_logp).sum(dim=-1)  # (B,T)
 
         loss_sum = (ce * valid).sum()
