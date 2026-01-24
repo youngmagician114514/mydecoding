@@ -170,7 +170,7 @@ def main():
         device_map=None,
         trust_remote_code=True,
     )
-
+        
     device = torch.device(args.device)
     edd = edd.to(device)
     target = target.to(device)

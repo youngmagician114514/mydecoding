@@ -33,23 +33,30 @@ def greedy_next_k(target, input_ids, attention_mask, k: int):
 
 
 @torch.no_grad()
-def edd_propose_k(draft, enc_hidden, input_ids, attention_mask, k: int):
+def edd_propose_k(draft, enc_hidden, ctx_len: int, k: int):
     """
-    EDD-style propose:
-      inputs_embeds = [enc_hidden ; embed(tokens_so_far)]
-      greedy next token each step
+    Propose K tokens using ONLY:
+      prefix = enc_hidden[:ctx_len]
+      suffix = embeddings of generated tokens so far (NOT including prompt tokens)
     """
-    device = input_ids.device
-    prompt_embeds = enc_hidden  # (1, T, H)
+    device = enc_hidden.device
+    prompt_embeds = enc_hidden[:, :ctx_len, :]   # (1, ctx_len, H)
 
-    cur_ids = input_ids
-    cur_mask = attention_mask
-
+    gen_ids = None  # (1, s)
     out_ids = []
+
     for _ in range(k):
-        tok_embeds = draft.get_input_embeddings()(cur_ids)  # (1,t,H)
-        inputs_embeds = torch.cat([prompt_embeds, tok_embeds], dim=1)  # (1,T+t,H)
-        attn_mask = torch.cat([cur_mask, cur_mask], dim=1)            # (1,T+t)
+        if gen_ids is None:
+            inputs_embeds = prompt_embeds
+        else:
+            tok_embeds = draft.get_input_embeddings()(gen_ids)  # (1, s, H)
+            inputs_embeds = torch.cat([prompt_embeds, tok_embeds], dim=1)  # (1, ctx_len+s, H)
+
+        attn_mask = torch.ones(
+            (inputs_embeds.size(0), inputs_embeds.size(1)),
+            dtype=torch.long,
+            device=device
+        )
 
         out = draft.model(
             inputs_embeds=inputs_embeds,
@@ -62,8 +69,7 @@ def edd_propose_k(draft, enc_hidden, input_ids, attention_mask, k: int):
         next_id = torch.argmax(logits, dim=-1)     # (1,1)
 
         out_ids.append(next_id.item())
-        cur_ids = torch.cat([cur_ids, next_id.to(device)], dim=1)
-        cur_mask = torch.cat([cur_mask, torch.ones_like(next_id, device=device)], dim=1)
+        gen_ids = next_id if gen_ids is None else torch.cat([gen_ids, next_id], dim=1)
 
     return out_ids
 
@@ -156,7 +162,8 @@ def main():
 
         enc_hidden = get_enc_hidden(target, input_ids, attn, args.enc_layer_index)
         t_next = greedy_next_k(target, input_ids, attn, args.K).squeeze(0).tolist()
-        d_next = edd_propose_k(draft, enc_hidden, input_ids, attn, args.K)
+        ctx_len = input_ids.shape[1]
+        d_next = edd_propose_k(draft, enc_hidden, ctx_len=ctx_len, k=args.K)
 
         acc = 0
         for i in range(args.K):

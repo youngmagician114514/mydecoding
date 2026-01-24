@@ -73,6 +73,8 @@ class EDDDraftModel(nn.Module):
                 draft.lm_head.weight.copy_(target.lm_head.weight)
                 if getattr(target.lm_head, "bias", None) is not None and getattr(draft.lm_head, "bias", None) is not None:
                     draft.lm_head.bias.copy_(target.lm_head.bias)
+            if hasattr(draft_cfg, "layer_types") and isinstance(draft_cfg.layer_types, (list, tuple)):
+                draft_cfg.layer_types = list(draft_cfg.layer_types)[:draft_cfg.num_hidden_layers]
 
         return cls(draft), target
 
