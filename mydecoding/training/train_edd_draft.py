@@ -1,6 +1,5 @@
-# train_edd_draft_masked_accum8_shift.py
-# (Generated) Based on train_edd_draft.py (batch update) + grad accumulation (micro_batch=1, accum=8) + shift_tokens support.
-# Faster EDD draft training: single forward with dual-block attention mask + grad accumulation (1 -> 8) + timing.
+# train_edd_draft_masked_batch.py
+# Faster EDD draft training: single forward with dual-block attention mask + direct batch update (no grad accumulation) + timing.
 
 from __future__ import annotations
 
@@ -120,8 +119,7 @@ def parse_args():
     p.add_argument("--output_dir", type=str, required=True)
 
     p.add_argument("--max_length", type=int, default=1024)   # recommend 1024 first (2T attention!)
-    p.add_argument("--micro_batch_size", type=int, default=1)
-    p.add_argument("--grad_accum", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=8)
 
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=1)
@@ -172,7 +170,7 @@ def main():
         device_map=None,
         trust_remote_code=True,
     )
-        
+
     device = torch.device(args.device)
     edd = edd.to(device)
     target = target.to(device)
@@ -180,28 +178,25 @@ def main():
     dataset = ShareGPTDataset(args.data_jsonl, tokenizer, max_length=args.max_length)
     loader = DataLoader(
         dataset,
-        batch_size=args.micro_batch_size,
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=PadCollator(tokenizer),
         pin_memory=True,
     )
-    if args.micro_batch_size != 1:
-        raise ValueError("This script is intended for micro_batch_size=1. Set --micro_batch_size 1.")
 
     print("Loaded samples:", len(dataset))
 
     optim = torch.optim.AdamW(edd.parameters(), lr=args.lr)
 
-    total_micro_steps = args.epochs * len(loader)
-    total_updates = math.ceil(total_micro_steps / args.grad_accum)
+    total_updates = args.epochs * len(loader)
     warmup_updates = int(total_updates * args.warmup_ratio)
     sched = get_linear_schedule_with_warmup(optim, warmup_updates, total_updates)
 
     edd.train()
     target.eval()
 
-    micro_step = 0
+    step = 0
     update_step = 0
 
     win_teacher = 0.0
@@ -214,7 +209,7 @@ def main():
 
     for epoch in range(args.epochs):
         for batch in loader:
-            micro_step += 1
+            step += 1
 
             cuda_sync()
             t0 = time.perf_counter()
@@ -254,10 +249,17 @@ def main():
                 shift_tokens=args.shift_tokens,
             )
 
-            (loss / args.grad_accum).backward()
+            loss.backward()
 
             cuda_sync()
             t_d1 = time.perf_counter()
+
+            # update every batch (no grad accumulation)
+            update_step += 1
+            torch.nn.utils.clip_grad_norm_(edd.parameters(), 1.0)
+            optim.step()
+            sched.step()
+            optim.zero_grad(set_to_none=True)
 
             cuda_sync()
             t1 = time.perf_counter()
@@ -270,35 +272,26 @@ def main():
             win_draft += micro_draft
             win_total += micro_total
 
-            if micro_step % 20 == 0:
+            if step % 20 == 0:
                 lr_now = sched.get_last_lr()[0] if update_step > 0 else optim.param_groups[0]["lr"]
                 print(
-                    f"[micro] epoch={epoch} micro={micro_step}/{total_micro_steps} "
+                    f"[step] epoch={epoch} step={step}/{args.epochs * len(loader)} "
                     f"L={L} loss={loss.item():.6f} "
                     f"t_total={micro_total:.3f}s (teacher={micro_teacher:.3f}s draft={micro_draft:.3f}s) "
                     f"lr={lr_now:.2e}"
                 )
 
-            do_update = (micro_step % args.grad_accum == 0) or (micro_step == total_micro_steps)
-            if do_update:
-                update_step += 1
-                torch.nn.utils.clip_grad_norm_(edd.parameters(), 1.0)
-                optim.step()
-                sched.step()
-                optim.zero_grad(set_to_none=True)
+            cuda_sync()
+            win_end_t = time.perf_counter()
+            wall = win_end_t - win_start_t
 
-                cuda_sync()
-                win_end_t = time.perf_counter()
-                wall = win_end_t - win_start_t
-
-                if (update_step % args.log_every_updates == 0) or (update_step <= 3):
-                    print(
-                        f"[update] epoch={epoch} update={update_step}/{total_updates} "
-                        f"window_wall={wall:.2f}s "
-                        f"sum_teacher={win_teacher:.2f}s sum_draft={win_draft:.2f}s sum_total={win_total:.2f}s "
-                        f"lr={sched.get_last_lr()[0]:.2e}"
-                    )
-
+            if (update_step % args.log_every_updates == 0) or (update_step <= 3):
+                print(
+                    f"[update] epoch={epoch} update={update_step}/{total_updates} "
+                    f"window_wall={wall:.2f}s "
+                    f"sum_teacher={win_teacher:.2f}s sum_draft={win_draft:.2f}s sum_total={win_total:.2f}s "
+                    f"lr={sched.get_last_lr()[0]:.2e}"
+                )
                 win_teacher = 0.0
                 win_draft = 0.0
                 win_total = 0.0

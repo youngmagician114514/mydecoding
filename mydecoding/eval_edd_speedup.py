@@ -110,67 +110,6 @@ def longest_prefix_match(student: torch.Tensor, teacher: torch.Tensor) -> int:
     return m
 
 
-# -------------------------
-# EDD draft propose K tokens
-# -------------------------
-@torch.no_grad()
-def edd_propose_k(
-    target: AutoModelForCausalLM,
-    draft: AutoModelForCausalLM,
-    ctx_ids: torch.Tensor,          # (1, t)
-    ctx_attn: torch.Tensor,         # (1, t)
-    K: int,
-    enc_layer_index: int,
-) -> torch.Tensor:
-    """
-    Propose K tokens using EDD-style: use target hidden states as soft prompt prefix.
-    Implementation (simple & faithful to "hidden-state prompt"):
-      - Run target once on ctx -> get enc_hidden = hidden_states[layer]
-      - Then autoregressively generate K tokens with draft, conditioning on prefix enc_hidden
-        (we DO NOT feed ctx token embeddings again; only feed generated tokens embeddings)
-    """
-    device = ctx_ids.device
-
-    # 1) encode with target
-    out_t = target(
-        input_ids=ctx_ids,
-        attention_mask=ctx_attn,
-        output_hidden_states=True,
-        use_cache=False,
-        return_dict=True,
-    )
-    enc_hidden = out_t.hidden_states[enc_layer_index]  # (1,t,H)
-
-    # 2) autoregressive K steps with draft
-    gen_tokens: List[torch.Tensor] = []
-    block_ids = None  # (1, s) tokens generated so far
-
-    for _ in range(K):
-        if block_ids is None:
-            # only prefix
-            inputs_embeds = enc_hidden
-            attn_mask = torch.ones((1, enc_hidden.size(1)), device=device, dtype=ctx_attn.dtype)
-        else:
-            tok_embeds = draft.get_input_embeddings()(block_ids)  # (1,s,H)
-            inputs_embeds = torch.cat([enc_hidden, tok_embeds], dim=1)  # (1,t+s,H)
-            attn_mask = torch.ones((1, inputs_embeds.size(1)), device=device, dtype=ctx_attn.dtype)
-
-        out_d = draft.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        h_last = out_d.last_hidden_state[:, -1, :]             # (1,H)
-        logits = draft.lm_head(h_last)                         # (1,V)
-        next_id = torch.argmax(logits, dim=-1, keepdim=True)   # (1,1)
-
-        gen_tokens.append(next_id)
-
-        block_ids = next_id if block_ids is None else torch.cat([block_ids, next_id], dim=1)
-
-    return torch.cat(gen_tokens, dim=1)  # (1,K)
-
 
 @torch.no_grad()
 def target_greedy_k(target: AutoModelForCausalLM, ctx_ids: torch.Tensor, ctx_attn: torch.Tensor, K: int) -> torch.Tensor:
@@ -185,6 +124,110 @@ def target_greedy_k(target: AutoModelForCausalLM, ctx_ids: torch.Tensor, ctx_att
         use_cache=True,
     )
     return gen[:, -K:]
+
+
+def _prefix_plus_causal_bias(prefix_len: int, total_len: int, dtype, device):
+    """
+    sequence = [PREFIX (hidden states) ; TOKEN_STREAM (embeddings)]
+    prefix_len = P
+    total_len = P + S
+
+    Rules:
+      - Token-stream queries (positions >= P) can attend to:
+          * all prefix keys [0..P-1]
+          * causal over token-stream keys [P..q]
+      - Prefix queries don't matter (we never take logits there), keep them fully open.
+    Returns additive bias (1,1,total_len,total_len) with 0 allowed, -inf masked.
+    """
+    neg_inf = torch.finfo(dtype).min
+    bias = torch.zeros((1, 1, total_len, total_len), device=device, dtype=dtype)
+
+    P = prefix_len
+    if total_len <= P:
+        return bias
+
+    # mask token-stream future
+    q = torch.arange(P, total_len, device=device).view(-1, 1)  # (S,1)
+    k = torch.arange(P, total_len, device=device).view(1, -1)  # (1,S)
+    allow = (k <= q)                                           # (S,S)
+    dd = torch.where(
+        allow,
+        torch.zeros_like(allow, dtype=dtype),
+        torch.full_like(allow, neg_inf, dtype=dtype),
+    )
+    bias[:, :, P:total_len, P:total_len] = dd
+    return bias
+
+
+@torch.no_grad()
+def propose_k_tminus1_hidden(
+    target,                 # AutoModelForCausalLM
+    draft,                  # AutoModelForCausalLM (your 1-layer draft)
+    ctx_ids: torch.Tensor,  # (1,T) verified prefix tokens
+    ctx_attn: torch.Tensor, # (1,T)
+    K: int = 5,
+    enc_layer_index: int = -4,
+):
+    """
+    Block-free proposal:
+      PREFIX  = h1..h_{T-1} (from target layer enc_layer_index)
+      TOKENS  = e(t_T), then e(d1), e(d2), ... autoregressively
+      Each step uses last position (a token position) -> lm_head -> next draft token.
+    """
+    device = ctx_ids.device
+    dtype = next(draft.parameters()).dtype
+
+    T = ctx_ids.size(1)
+    assert T >= 1, "ctx_ids must contain at least 1 verified token"
+
+    # 1) get hidden states from target
+    out_t = target(
+        input_ids=ctx_ids,
+        attention_mask=ctx_attn,
+        output_hidden_states=True,
+        use_cache=False,
+        return_dict=True,
+    )
+    enc = out_t.hidden_states[enc_layer_index].to(dtype=dtype)  # (1,T,H)
+
+    # PREFIX: h1..h_{T-1}
+    if T > 1:
+        prefix = enc[:, :-1, :]  # (1,T-1,H)
+        P = T - 1
+    else:
+        prefix = None
+        P = 0
+
+    # TOKEN STREAM starts from last verified token t_T
+    tok_stream = ctx_ids[:, -1:].clone()  # (1,1) = [t_T]
+    gen = []
+
+    for _ in range(K):
+        tok_emb = draft.get_input_embeddings()(tok_stream).to(dtype=dtype)  # (1,S,H)
+
+        if prefix is None:
+            inputs_embeds = tok_emb                      # (1,S,H)
+        else:
+            inputs_embeds = torch.cat([prefix, tok_emb], dim=1)  # (1,P+S,H)
+
+        L = inputs_embeds.size(1)
+        attn_bias = _prefix_plus_causal_bias(P, L, inputs_embeds.dtype, device)
+
+        out_d = draft.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn_bias,
+            use_cache=False,
+            return_dict=True,
+        )
+
+        h_last = out_d.last_hidden_state[:, -1, :]       # last token position
+        logits = draft.lm_head(h_last)                   # (1,V)
+        next_id = torch.argmax(logits, dim=-1, keepdim=True)  # (1,1)
+
+        gen.append(next_id)
+        tok_stream = torch.cat([tok_stream, next_id], dim=1)  # append generated token
+
+    return torch.cat(gen, dim=1)  # (1,K)
 
 
 def main():
@@ -249,7 +292,14 @@ def main():
         ctx_attn = attn[:, :ctx_len]
 
         teacher_tokens = target_greedy_k(target, ctx_ids, ctx_attn, args.K)
-        student_tokens = edd_propose_k(target, draft, ctx_ids, ctx_attn, args.K, args.enc_layer_index)
+        student_tokens = propose_k_tminus1_hidden(
+            target=target,
+            draft=draft,              # 你的 draft 模型
+            ctx_ids=ctx_ids,
+            ctx_attn=ctx_attn,
+            K=5,
+            enc_layer_index=-4,
+        )
 
         m = longest_prefix_match(student_tokens[0], teacher_tokens[0])
         accepted_lens.append(m)

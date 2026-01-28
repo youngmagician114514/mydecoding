@@ -104,6 +104,7 @@ class EDDDraftModel(nn.Module):
         attention_mask: torch.Tensor,  # (B,T) 1=valid
         block_len: int,
         dtype: torch.dtype,
+        token_attention_mask: Optional[torch.Tensor] = None,  # (B,T) for token-half (optional)
     ) -> torch.Tensor:
         """
         Return additive attention bias (B,1,S,S) where S=2T.
@@ -150,7 +151,13 @@ class EDDDraftModel(nn.Module):
 
         # Key padding: both hidden and token positions share the same validity from attention_mask
         valid_1 = attention_mask.to(torch.bool)                  # (B,T)
-        valid_2 = torch.cat([valid_1, valid_1], dim=1)           # (B,2T)
+        if token_attention_mask is None:
+            valid_tok = valid_1
+        else:
+            if token_attention_mask.shape != attention_mask.shape:
+                raise ValueError(f"token_attention_mask shape {token_attention_mask.shape} != attention_mask {attention_mask.shape}")
+            valid_tok = token_attention_mask.to(torch.bool)
+        valid_2 = torch.cat([valid_1, valid_tok], dim=1)           # (B,2T)
 
         # Base bias from allow (same for all batch)
         bias = torch.where(allow, torch.zeros((), device=device, dtype=dtype), torch.full((), neg_inf, device=device, dtype=dtype))
@@ -166,8 +173,10 @@ class EDDDraftModel(nn.Module):
         # For invalid queries, allow attending to key=0 (if it is valid; otherwise key=0 is also pad but we still force it).
         query_invalid = ~valid_2  # (B,S)
         if query_invalid.any():
-            bias[query_invalid.view(B, 1, S, 1).expand(B, 1, S, S)] = neg_inf
-            bias[query_invalid, 0, 0] = 0  # (advanced indexing) allow key 0
+            b_idx, q_idx = torch.where(query_invalid)   # 每个无效query的(batch, query_pos)
+            bias[b_idx, 0, q_idx, :] = neg_inf           # 该query整行先置 -inf
+            bias[b_idx, 0, q_idx, 0] = 0                 # 但强制允许 attend 到 key=0，避免全 -inf 行导致 NaN
+
 
         return bias
 
@@ -214,6 +223,7 @@ class EDDDraftModel(nn.Module):
         kl_mode: str = "topk",        # "topk" or "full"
         topk: int = 32,
         kl_chunk_size: int = 4096,
+        shift_tokens: int = 0,        # 0: supervise t_{i+1} from t_i (original); 1: supervise t_{i+2} from t_{i+1} (seed-aligned)
     ) -> torch.Tensor:
         """
         Single-forward dual-block training (Eq.3 dual-block mask + KL loss Eq.4):
@@ -229,11 +239,50 @@ class EDDDraftModel(nn.Module):
         assert input_ids.dim() == 2
         B, T = input_ids.shape
 
-        tok_embeds = self.draft_lm.get_input_embeddings()(input_ids)  # (B,T,H)
-        inputs_embeds = torch.cat([enc_hidden, tok_embeds], dim=1)    # (B,2T,H)
+        # --- Optional shift to align with "seed-first" inference ---
+        # shift_tokens=0 (default): token-half sees t_i and predicts t_{i+1} (matches original implementation)
+        # shift_tokens=1: token-half sees t_{i+1} (as seed) and predicts t_{i+2}
+        if shift_tokens not in (0, 1):
+            raise ValueError(f"shift_tokens must be 0 or 1, got {shift_tokens}")
 
-        # 4D attention bias (dual-block visibility)
-        attn_bias = self._dual_block_attn_bias(attention_mask, block_len, dtype=inputs_embeds.dtype)
+        # Token ids for token-half (length T)
+        if shift_tokens == 0:
+            tok_ids = input_ids
+            teacher_used = teacher_logits
+            token_attention_mask = attention_mask
+        else:
+            # Shift token-half right by 1: [t2..tT, PAD]
+            pad_id = getattr(self.draft_lm.config, "pad_token_id", None)
+
+            # 有些 config 可能是 list/tuple（多 eos/pad），取第一个
+            if isinstance(pad_id, (list, tuple)):
+                pad_id = pad_id[0] if len(pad_id) > 0 else None
+
+            if pad_id is None:
+                pad_id = getattr(self.draft_lm.config, "eos_token_id", 0)
+                if isinstance(pad_id, (list, tuple)):
+                    pad_id = pad_id[0] if len(pad_id) > 0 else 0
+
+            pad_id = int(pad_id)
+
+            pad_col = torch.full((B, 1), int(pad_id), device=input_ids.device, dtype=input_ids.dtype)
+            tok_ids = torch.cat([input_ids[:, 1:], pad_col], dim=1)
+            # Teacher logits shift: student position j aligns to teacher position j+1
+            teacher_used = torch.cat([teacher_logits[:, 1:, :], teacher_logits[:, -1:, :]], dim=1)
+            # Token-half attention mask shift: [m2..mT, 0]
+            zero_col = torch.zeros((B, 1), device=attention_mask.device, dtype=attention_mask.dtype)
+            token_attention_mask = torch.cat([attention_mask[:, 1:], zero_col], dim=1)
+
+        tok_embeds = self.draft_lm.get_input_embeddings()(tok_ids)  # (B,T,H)
+        inputs_embeds = torch.cat([enc_hidden, tok_embeds], dim=1)  # (B,2T,H)
+
+        # 4D attention bias (dual-block visibility); token-half can use a different padding mask when shift_tokens=1
+        attn_bias = self._dual_block_attn_bias(
+            attention_mask=attention_mask,
+            block_len=block_len,
+            dtype=inputs_embeds.dtype,
+            token_attention_mask=token_attention_mask,
+        )
 
         # Run transformer body once; apply lm_head only to token half
         out = self.draft_lm.model(
@@ -246,23 +295,28 @@ class EDDDraftModel(nn.Module):
         hidden_tok = hidden[:, T:, :]            # (B,T,H)
         logits_tok = self.draft_lm.lm_head(hidden_tok)  # (B,T,V)
 
-        # Valid positions for next-token loss: need pos and pos+1 both valid, and pos <= T-2
-        cur_valid = attention_mask[:, :T]                       # (B,T)
-        nxt_valid = torch.zeros_like(cur_valid)
-        nxt_valid[:, :-1] = attention_mask[:, 1:]
-        valid = (cur_valid * nxt_valid).float()                 # (B,T)
-        valid[:, -1] = 0.0
+        # Valid positions for KL: for position j, we need both current and "next" tokens to exist.
+        # shift_tokens=0: j uses mask[j] & mask[j+1] (original)
+        # shift_tokens=1: j aligns to original j+1 and predicts original j+2 => mask[j+1] & mask[j+2]
+        valid = torch.zeros((B, T), device=attention_mask.device, dtype=torch.float32)
+        if shift_tokens == 0:
+            valid[:, :-1] = (attention_mask[:, :-1] * attention_mask[:, 1:]).float()
+            valid[:, -1] = 0.0
+        else:
+            if T >= 3:
+                valid[:, :-2] = (attention_mask[:, 1:-1] * attention_mask[:, 2:]).float()
+            valid[:, -2:] = 0.0
 
         if kl_mode == "full":
             return self._kl_full_vocab_chunked(
-                teacher_logits=teacher_logits,
+                teacher_logits=teacher_used,
                 student_logits=logits_tok,
                 valid=valid,
                 chunk_size=kl_chunk_size,
             )
 
         # ---- top-k approx (teacher support only) ----
-        t_logits = teacher_logits.float()
+        t_logits = teacher_used.float()
         s_logits = logits_tok.float()
 
         t_topv, t_topi = torch.topk(t_logits, k=min(topk, t_logits.size(-1)), dim=-1)  # (B,T,K)
