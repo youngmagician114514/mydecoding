@@ -10,6 +10,9 @@ build/
 # VSCode
 .vscode/
 
+mydecoding/training/checkpoints/
+mydecoding/base_model/
+
 *.txt
 *.pt
 *.png

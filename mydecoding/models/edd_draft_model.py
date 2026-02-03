@@ -1,337 +1,360 @@
-# edd_draft_model_masked.py
-# EDD draft model (draft only; no tree/PCT)
-# Faster dual-block training: single forward with dual-block attention mask (Figure 3(a) in ECNU-EDD).
+# edd_draft_model_effective.py
+# Effective Draft Decoder (Faster-SD style) adapted to generic HF causal LMs (Llama3.x, Qwen2, etc.)
+# - No hard-coded vocab size
+# - Uses one (or N) transformer blocks copied from teacher for architecture compatibility
+# - Copies embedding + lm_head weights from teacher
+# - Implements Faster-SD dual-block mask + position_ids scheme
 #
-# Key idea:
-#   Build a combined sequence of length 2T: [H_1..H_T, t_1..t_T] as inputs_embeds,
-#   then build a 4D additive attention mask that enforces:
-#     - hidden queries (H part): causal inside H only
-#     - token queries (T part): can attend to
-#         (i) hidden keys up to start of its block (jL)
-#         (ii) token keys inside its own block up to itself (causal inside block)
-#       and cannot attend to tokens from earlier blocks.
-#
-# Loss: KL(P_teacher || P_draft) over token positions only (the second half).
+# Expected training call (see train_edd_draft_effective_single_gpu.py):
+#   loss_ce, loss_kl = draft(encoder_out=teacher_hidden, labels=input_ids, llm_logits=teacher_logits_tail)
 
 from __future__ import annotations
 
 import copy
+import math
+import random
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from torch import nn
+from torch.nn import CrossEntropyLoss
+
+from transformers import AutoModelForCausalLM, AutoConfig
+
+
+def _get_attr(obj: Any, names: Tuple[str, ...]) -> Optional[Any]:
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return None
+
+def ce_from_teacher_chunked(teacher_logits, student_logits, chunk=16384):
+    # teacher_logits, student_logits: (B, L, V)
+    t = teacher_logits.float()
+    s = student_logits.float()
+    B, L, V = t.shape
+
+    t_logZ = torch.logsumexp(t, dim=-1, keepdim=True)  # (B,L,1)
+    s_logZ = torch.logsumexp(s, dim=-1, keepdim=True)  # (B,L,1)
+
+    ce = 0.0
+    for st in range(0, V, chunk):
+        ed = min(V, st + chunk)
+        t_chunk = t[..., st:ed]
+        s_chunk = s[..., st:ed]
+
+        p_t = torch.exp(t_chunk - t_logZ)     # teacher probs chunk
+        logp_s = s_chunk - s_logZ             # student log-probs chunk
+        ce = ce + (p_t * (-logp_s)).sum(dim=-1)  # (B,L)
+
+    return ce  # (B,L)
+
+
+
+def _get_base_and_layers(teacher: nn.Module):
+    """
+    Return (base_model, layers_modulelist, norm_module_or_None).
+    Works for most HF decoder-only LMs:
+      - Llama/Llama2/Llama3: teacher.model.layers, teacher.model.norm
+      - Qwen2: teacher.model.layers, teacher.model.norm (usually)
+      - GPT-like: teacher.transformer.h, teacher.transformer.ln_f
+    """
+    # Common: .model.layers
+    if hasattr(teacher, "model") and hasattr(teacher.model, "layers"):
+        base = teacher.model
+        layers = teacher.model.layers
+        norm = _get_attr(base, ("norm", "final_layernorm", "ln_f"))
+        return base, layers, norm
+
+    # GPT-NeoX style: .gpt_neox.layers
+    if hasattr(teacher, "gpt_neox") and hasattr(teacher.gpt_neox, "layers"):
+        base = teacher.gpt_neox
+        layers = teacher.gpt_neox.layers
+        norm = _get_attr(base, ("final_layer_norm", "ln_f"))
+        return base, layers, norm
+
+    # GPT-2 style: .transformer.h
+    if hasattr(teacher, "transformer") and hasattr(teacher.transformer, "h"):
+        base = teacher.transformer
+        layers = teacher.transformer.h
+        norm = _get_attr(base, ("ln_f", "norm", "final_layernorm"))
+        return base, layers, norm
+
+    raise ValueError(
+        "Unsupported teacher model structure: cannot find transformer layers. "
+        "Expected teacher.model.layers or teacher.transformer.h."
+    )
 
 
 @dataclass
-class EDDEncoding:
-    teacher_logits: torch.Tensor  # (B, T, V)
-    enc_hidden: torch.Tensor      # (B, T, H)
+class DraftConfig:
+    target_model_name_or_path: str
+    num_layers: int
+    block_len_min: int
+    block_len_max: int
+    hidden_layer_index: int
 
 
-class EDDDraftModel(nn.Module):
-    def __init__(self, draft_lm: nn.Module):
+class Effective_Draft_Decoder(nn.Module):
+    """
+    Faster-SD style 'Effective Draft Decoder', but made architecture-agnostic by copying
+    decoder blocks from the teacher model.
+
+    Key points (matching Faster-SD model.py):
+      - Inputs: encoder_out (teacher hidden states), labels (full input_ids), llm_logits (teacher logits tail)
+      - Random block length in [block_len_min, block_len_max]
+      - Rebuild position_ids so the token-stream positions match original sequence positions
+      - Dual-block mask: token-stream blocks cannot attend to the corresponding encoder_out slice
+      - Loss: returns (CE loss, KL loss); training typically uses KL only
+    """
+
+    def __init__(
+        self,
+        teacher: AutoModelForCausalLM,
+        num_layers: int = 1,
+        block_len_min: int = 5,
+        block_len_max: int = 10,
+    ):
         super().__init__()
-        self.draft_lm = draft_lm
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if block_len_min < 1 or block_len_max < block_len_min:
+            raise ValueError("Invalid block_len range")
+
+        self.block_len_min = int(block_len_min)
+        self.block_len_max = int(block_len_max)
+
+        cfg = teacher.config
+        vocab_size = int(getattr(cfg, "vocab_size", teacher.get_input_embeddings().weight.shape[0]))
+        hidden_size = int(getattr(cfg, "hidden_size", teacher.get_input_embeddings().weight.shape[1]))
+
+        # Embedding + LM head: same shapes as teacher; copy weights outside (from_teacher()).
+        self.embedding_layer = nn.Embedding(vocab_size, hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+        # Copy N decoder blocks from teacher (deepcopy to make them trainable & independent).
+        base, layers, norm = _get_base_and_layers(teacher)
+        # Rotary embedding (for newer Transformers: layers expect precomputed (cos, sin) via position_embeddings)
+        self.rotary_emb = copy.deepcopy(getattr(base, "rotary_emb", None))
+        if len(layers) < num_layers:
+            raise ValueError(f"Teacher has only {len(layers)} layers, but num_layers={num_layers}")
+        self.decoder_layers = nn.ModuleList([copy.deepcopy(layers[i]) for i in range(num_layers)])
+
+        # Final norm (copy if teacher has it, else Identity)
+        self.norm = copy.deepcopy(norm) if norm is not None else nn.Identity()
 
     @classmethod
-    def from_target(
+    def from_teacher(
         cls,
-        target_model_name_or_path: str,
-        torch_dtype: torch.dtype = torch.bfloat16,
-        device_map: Optional[str] = None,
-        trust_remote_code: bool = True,
-    ) -> Tuple["EDDDraftModel", nn.Module]:
-        # Load target (frozen)
-        target = AutoModelForCausalLM.from_pretrained(
-            target_model_name_or_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-        )
-        target.eval()
-        for p in target.parameters():
-            p.requires_grad_(False)
+        teacher: AutoModelForCausalLM,
+        num_layers: int = 1,
+        block_len_min: int = 5,
+        block_len_max: int = 10,
+    ) -> "Effective_Draft_Decoder":
+        draft = cls(teacher, num_layers=num_layers, block_len_min=block_len_min, block_len_max=block_len_max)
 
-        # Draft config: same as target but 1 layer
-        draft_cfg = copy.deepcopy(target.config)
-        if hasattr(draft_cfg, "num_hidden_layers"):
-            draft_cfg.num_hidden_layers = 1
-        elif hasattr(draft_cfg, "n_layer"):
-            draft_cfg.n_layer = 1
-        else:
-            raise ValueError("Unknown config field for num layers; adapt for your model family.")
-
-        draft = AutoModelForCausalLM.from_config(draft_cfg, trust_remote_code=trust_remote_code)
-
-        # Init: copy embeddings + lm_head
+        # Copy embedding + lm_head weights from teacher (Faster-SD train.py does this).
         with torch.no_grad():
-            draft.get_input_embeddings().weight.copy_(target.get_input_embeddings().weight)
-            if hasattr(draft, "lm_head") and hasattr(target, "lm_head"):
-                draft.lm_head.weight.copy_(target.lm_head.weight)
-                if getattr(target.lm_head, "bias", None) is not None and getattr(draft.lm_head, "bias", None) is not None:
-                    draft.lm_head.bias.copy_(target.lm_head.bias)
-            if hasattr(draft_cfg, "layer_types") and isinstance(draft_cfg.layer_types, (list, tuple)):
-                draft_cfg.layer_types = list(draft_cfg.layer_types)[:draft_cfg.num_hidden_layers]
+            # input embedding
+            emb = teacher.get_input_embeddings()
+            draft.embedding_layer.weight.copy_(emb.weight)
 
-        return cls(draft), target
+            # output embedding / lm_head
+            out_emb = teacher.get_output_embeddings()
+            if out_emb is None and hasattr(teacher, "lm_head"):
+                out_emb = teacher.lm_head
+            if out_emb is None:
+                raise ValueError("Teacher model has no output embeddings / lm_head.")
+            draft.lm_head.weight.copy_(out_emb.weight)
 
-    @torch.no_grad()
-    def encode_with_target(
-        self,
-        target_model: nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        enc_layer_index: int = -4,
-    ) -> EDDEncoding:
-        out = target_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
+        return draft
+
+    def _build_position_ids(self, enc_len: int, inp_len: int, label_len: int, device) -> torch.Tensor:
+        """
+        Match Faster-SD behavior:
+          - encoder_out positions: 0..enc_len-1
+          - token-stream positions: inp_len..inp_len+label_len-1  (NOT enc_len..enc_len+label_len-1)
+        """
+        pos0 = torch.arange(enc_len, dtype=torch.long, device=device)
+        pos1 = torch.arange(inp_len, inp_len + label_len, dtype=torch.long, device=device)
+        pos = torch.cat([pos0, pos1], dim=0)[None, :]
+        return pos
+
+    def _build_dual_block_mask(self, enc_len: int, total_len: int, inp_len: int, pred_len: int, device, dtype):
+        """
+        Build additive attention mask (float, -inf for masked) of shape (1,1,S,S).
+        This matches Faster-SD model.py logic:
+          - start from standard causal mask over total_len tokens
+          - additionally, for each token-stream block [i:i+pred_len], forbid attending to
+            encoder_out slice [inp_len + i - enc_len : i].
+        """
+        S = total_len
+        causal_mask = torch.triu(torch.ones(S, S, device=device, dtype=torch.bool), diagonal=1)
+        attn = torch.zeros((S, S), device=device, dtype=torch.float32)
+        attn[causal_mask] = float("-inf")
+
+        # Apply block restriction for token-stream part
+        for i in range(enc_len, S, pred_len):
+            # columns to block are within encoder_out region
+            col_start = inp_len + i - enc_len
+            col_end = i
+            if col_start < 0:
+                col_start = 0
+            if col_start < col_end:
+                attn[i : min(i + pred_len, S), col_start:col_end] = float("-inf")
+
+        mask = attn.to(dtype=dtype)[None, None, :, :]
+        return mask
+
+    def _compute_position_embeddings(self, x: torch.Tensor, position_ids: torch.Tensor):
+        """
+        Newer Transformers (e.g. recent Llama) expect precomputed rotary position embeddings
+        to be passed into each decoder layer as `position_embeddings=(cos, sin)`.
+        We try to compute them from `self.rotary_emb` if available; otherwise return None.
+        """
+        if getattr(self, "rotary_emb", None) is None:
+            return None
+        try:
+            return self.rotary_emb(x, position_ids)
+        except TypeError:
+            # Some implementations may not take `x`
+            try:
+                return self.rotary_emb(position_ids)
+            except Exception:
+                return None
+
+    def forward(self, encoder_out: torch.Tensor, labels: torch.Tensor, llm_logits: torch.Tensor):
+        """
+        encoder_out: (B, seq_len, H)    teacher hidden states for the *full* input (prompt+answer)
+        labels:      (B, seq_len)       full input_ids (prompt+answer)
+        llm_logits:  (B, label_len, V)  teacher logits for the answer tail (same len as answer)
+
+        Returns:
+          (ce_loss, kl_loss)
+        """
+        B, enc_len, H = encoder_out.shape
+        if labels.dim() != 2 or labels.shape[0] != B:
+            raise ValueError("labels must be (B, seq_len)")
+        label_len = llm_logits.shape[1]
+        if label_len <= 1:
+            raise ValueError("label_len must be > 1 for shifted next-token KL/CE")
+
+        inp_len = enc_len - label_len  # prompt length
+        if inp_len < 0:
+            raise ValueError("encoder_out length must be >= label_len")
+
+        # Random block length (pred_len in Faster-SD code)
+        pred_len = random.randint(self.block_len_min, self.block_len_max)
+
+        # Token-stream embeddings use the answer token ids (suffix)
+        input_ids = labels[:, inp_len:]  # (B, label_len)
+        input_embeds = self.embedding_layer(input_ids)  # (B, label_len, H)
+
+        # Concatenate teacher hidden + token-stream embeddings
+        hidden_states = torch.cat([encoder_out, input_embeds], dim=1)  # (B, enc_len + label_len, H)
+        total_len = hidden_states.shape[1]
+
+        # position_ids & attention_mask
+        position_ids = self._build_position_ids(enc_len=enc_len, inp_len=inp_len, label_len=label_len, device=hidden_states.device)
+        # expand to batch (some HF layers expect (B, S))
+        if position_ids.size(0) != B:
+            position_ids = position_ids.expand(B, -1)
+
+        attention_mask = self._build_dual_block_mask(
+            enc_len=enc_len,
+            total_len=total_len,
+            inp_len=inp_len,
+            pred_len=pred_len,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
-        hs = out.hidden_states
-        if hs is None:
-            raise RuntimeError("Target did not return hidden_states; ensure output_hidden_states=True works.")
-        enc_hidden = hs[enc_layer_index]  # (B,T,H)
-        teacher_logits = out.logits       # (B,T,V)
-        return EDDEncoding(teacher_logits=teacher_logits, enc_hidden=enc_hidden)
+        # expand to batch (broadcasting works for most models; this makes it explicit)
+        if attention_mask.size(0) != B:
+            attention_mask = attention_mask.expand(B, -1, -1, -1)
 
-    @staticmethod
-    def _dual_block_attn_bias(
-        attention_mask: torch.Tensor,  # (B,T) 1=valid
-        block_len: int,
-        dtype: torch.dtype,
-        token_attention_mask: Optional[torch.Tensor] = None,  # (B,T) for token-half (optional)
-    ) -> torch.Tensor:
-        """
-        Return additive attention bias (B,1,S,S) where S=2T.
-        0 means allowed; -inf means masked.
-        """
-        device = attention_mask.device
-        B, T = attention_mask.shape
-        S = 2 * T
-        neg_inf = torch.finfo(dtype).min
+        # Run N decoder layers. Each layer returns tuple (hs, ...)
+        position_embeddings = self._compute_position_embeddings(hidden_states, position_ids)
+        x = hidden_states
+        for layer in self.decoder_layers:
+            try:
+                out = layer(x, attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)
+            except TypeError:
+                # Older implementations may not support `position_embeddings`
+                out = layer(x, attention_mask=attention_mask, position_ids=position_ids)
+            x = out[0] if isinstance(out, (tuple, list)) else out
 
-        # Build indices
-        idx = torch.arange(T, device=device)  # (T,)
-        block_id = idx // block_len
-        block_start = block_id * block_len  # (T,)
+        x = self.norm(x)
+        logits = self.lm_head(x)  # (B, total_len, V)
 
-        # Allowed for token queries:
-        # token query at i can attend to:
-        #   - hidden keys < block_start[i]
-        #   - token keys in same block AND <= i
-        #
-        # We'll build two boolean matrices (T,T):
-        #   allow_token_to_hidden[i,k] where i=query token idx, k=hidden idx
-        #   allow_token_to_token[i,k]  where i=query token idx, k=token idx
-        k = idx.view(1, T)  # (1,T)
-        i = idx.view(T, 1)  # (T,1)
+        # Align to Faster-SD training:
+        # student logits: token-stream positions, shifted (exclude last)
+        student = logits[:, -label_len:-1, :].float().contiguous().view(-1, logits.size(-1))
+        # teacher logits: answer tail, shifted (exclude last)
+        teacher = llm_logits[:, :-1, :].float().contiguous().view(-1, logits.size(-1))
 
-        allow_token_to_hidden = k < block_start.view(T, 1)  # (T,T)
-        allow_token_to_token = (block_id.view(T, 1) == block_id.view(1, T)) & (k <= i)  # same block, causal inside block
+        # --- chunked full-vocab KL with reduction="batchmean" (memory-safe) ---
+        # student: (N, V) float
+        # teacher: (N, V) float
+        # NOTE: This computes KL(pt||ps) with the same scaling as F.kl_div(..., reduction="batchmean")
 
-        # Hidden queries: causal inside hidden
-        allow_hidden_to_hidden = k <= i  # (T,T)
+        chunk = getattr(self, "kl_chunk_size", 16384)
 
-        # Compose full allow matrix for SxS (hidden+token)
-        allow = torch.zeros((S, S), device=device, dtype=torch.bool)
+        # Precompute log-normalizers
+        t_logZ = torch.logsumexp(teacher, dim=-1, keepdim=True)  # (N, 1)
+        s_logZ = torch.logsumexp(student, dim=-1, keepdim=True)  # (N, 1)
 
-        # hidden queries -> hidden keys
-        allow[:T, :T] = allow_hidden_to_hidden
-        # hidden queries -> token keys (disallow; already False)
+        # KL = sum_v p_t(v) * (log p_t(v) - log p_s(v))
+        # We'll compute it in vocab chunks to avoid allocating full softmax tensors.
+        kl_per_row = torch.zeros((student.size(0),), device=student.device, dtype=student.dtype)  # (N,)
 
-        # token queries -> hidden keys
-        allow[T:, :T] = allow_token_to_hidden
-        # token queries -> token keys
-        allow[T:, T:] = allow_token_to_token
+        V = student.size(-1)
+        for st in range(0, V, chunk):
+            ed = min(V, st + chunk)
+            t_chunk = teacher[:, st:ed]  # (N, C)
+            s_chunk = student[:, st:ed]  # (N, C)
 
-        # Key padding: both hidden and token positions share the same validity from attention_mask
-        valid_1 = attention_mask.to(torch.bool)                  # (B,T)
-        if token_attention_mask is None:
-            valid_tok = valid_1
-        else:
-            if token_attention_mask.shape != attention_mask.shape:
-                raise ValueError(f"token_attention_mask shape {token_attention_mask.shape} != attention_mask {attention_mask.shape}")
-            valid_tok = token_attention_mask.to(torch.bool)
-        valid_2 = torch.cat([valid_1, valid_tok], dim=1)           # (B,2T)
+            logp_t = t_chunk - t_logZ    # (N, C)
+            logp_s = s_chunk - s_logZ    # (N, C)
+            p_t = torch.exp(logp_t).detach()  # teacher distribution, no grad
 
-        # Base bias from allow (same for all batch)
-        bias = torch.where(allow, torch.zeros((), device=device, dtype=dtype), torch.full((), neg_inf, device=device, dtype=dtype))
-        bias = bias.view(1, 1, S, S).expand(B, 1, S, S).contiguous()
+            kl_per_row += (p_t * (logp_t - logp_s)).sum(dim=-1)  # (N,)
 
-        # Mask out padded keys (for all queries)
-        # If a key position is invalid, set bias[..., :, key] = -inf
-        key_invalid = ~valid_2  # (B,S)
-        if key_invalid.any():
-            bias = bias.masked_fill(key_invalid.view(B, 1, 1, S), neg_inf)
-
-        # Avoid rows with all -inf (can create NaNs) for padded queries:
-        # For invalid queries, allow attending to key=0 (if it is valid; otherwise key=0 is also pad but we still force it).
-        query_invalid = ~valid_2  # (B,S)
-        if query_invalid.any():
-            b_idx, q_idx = torch.where(query_invalid)   # 每个无效query的(batch, query_pos)
-            bias[b_idx, 0, q_idx, :] = neg_inf           # 该query整行先置 -inf
-            bias[b_idx, 0, q_idx, 0] = 0                 # 但强制允许 attend 到 key=0，避免全 -inf 行导致 NaN
+        # reduction="batchmean": sum over all rows, divided by batch size B
+        kl_loss = kl_per_row.sum() / max(1, student.size(0))
+        # --- end chunked KL ---
 
 
-        return bias
+        # CE (optional, not usually used)
+        tgt = labels[:, -label_len + 1 :].contiguous().view(-1)
+        ce_loss = CrossEntropyLoss()(student, tgt)
 
-    @staticmethod
-    def _kl_full_vocab_chunked(
-        teacher_logits: torch.Tensor,   # (B,T,V) float/half ok
-        student_logits: torch.Tensor,   # (B,T,V)
-        valid: torch.Tensor,            # (B,T) float 0/1
-        chunk_size: int = 4096,
-    ) -> torch.Tensor:
-        """Exact KL(Pt || Pd) computed in vocab chunks to reduce peak memory.
-        KL = sum_x p_t(x) * (log p_t(x) - log p_d(x)).
-        We avoid materializing full softmax by using logsumexp for denominators and chunked exp.
-        """
-        # (B,T)
-        logZ_t = torch.logsumexp(teacher_logits.float(), dim=-1)
-        logZ_s = torch.logsumexp(student_logits.float(), dim=-1)
+        return ce_loss, kl_loss
 
-        B, T, V = teacher_logits.shape
-        kl_bt = torch.zeros((B, T), device=teacher_logits.device, dtype=torch.float32)
+    def save_weights(self, path: str):
+        torch.save(self.state_dict(), path)
 
-        for v0 in range(0, V, chunk_size):
-            v1 = min(v0 + chunk_size, V)
-            t_chunk = teacher_logits[:, :, v0:v1].float()  # (B,T,C)
-            s_chunk = student_logits[:, :, v0:v1].float()  # (B,T,C)
+    def load_weights(self, path: str, map_location="cpu"):
+        sd = torch.load(path, map_location=map_location)
+        self.load_state_dict(sd, strict=True)
+        return self
 
-            logp_t = t_chunk - logZ_t.unsqueeze(-1)
-            logp_s = s_chunk - logZ_s.unsqueeze(-1)
-            p_t = torch.exp(logp_t)  # (B,T,C)
 
-            kl_bt += (p_t * (logp_t - logp_s)).sum(dim=-1)
-
-        loss_sum = (kl_bt * valid).sum()
-        weight_sum = valid.sum().clamp_min(1.0)
-        return loss_sum / weight_sum
-
-    def kl_loss_dual_block_masked(
-        self,
-        input_ids: torch.Tensor,      # (B,T)
-        attention_mask: torch.Tensor, # (B,T)
-        teacher_logits: torch.Tensor, # (B,T,V)
-        enc_hidden: torch.Tensor,     # (B,T,H)
-        block_len: int,
-        kl_mode: str = "topk",        # "topk" or "full"
-        topk: int = 32,
-        kl_chunk_size: int = 4096,
-        shift_tokens: int = 0,        # 0: supervise t_{i+1} from t_i (original); 1: supervise t_{i+2} from t_{i+1} (seed-aligned)
-    ) -> torch.Tensor:
-        """
-        Single-forward dual-block training (Eq.3 dual-block mask + KL loss Eq.4):
-
-        1) inputs_embeds = concat([enc_hidden, embed(input_ids)])   # length 2T
-        2) pass 4D additive mask enforcing Figure-3(a) visibility
-        3) compute KL(P_teacher || P_draft) on token half only
-
-        Note on KL:
-        - kl_mode="full": exact full-vocab KL via chunked computation (recommended for faithful paper reproduction).
-        - kl_mode="topk": teacher-topk approximation (faster/less compute but can hurt acceptance).
-        """
-        assert input_ids.dim() == 2
-        B, T = input_ids.shape
-
-        # --- Optional shift to align with "seed-first" inference ---
-        # shift_tokens=0 (default): token-half sees t_i and predicts t_{i+1} (matches original implementation)
-        # shift_tokens=1: token-half sees t_{i+1} (as seed) and predicts t_{i+2}
-        if shift_tokens not in (0, 1):
-            raise ValueError(f"shift_tokens must be 0 or 1, got {shift_tokens}")
-
-        # Token ids for token-half (length T)
-        if shift_tokens == 0:
-            tok_ids = input_ids
-            teacher_used = teacher_logits
-            token_attention_mask = attention_mask
-        else:
-            # Shift token-half right by 1: [t2..tT, PAD]
-            pad_id = getattr(self.draft_lm.config, "pad_token_id", None)
-
-            # 有些 config 可能是 list/tuple（多 eos/pad），取第一个
-            if isinstance(pad_id, (list, tuple)):
-                pad_id = pad_id[0] if len(pad_id) > 0 else None
-
-            if pad_id is None:
-                pad_id = getattr(self.draft_lm.config, "eos_token_id", 0)
-                if isinstance(pad_id, (list, tuple)):
-                    pad_id = pad_id[0] if len(pad_id) > 0 else 0
-
-            pad_id = int(pad_id)
-
-            pad_col = torch.full((B, 1), int(pad_id), device=input_ids.device, dtype=input_ids.dtype)
-            tok_ids = torch.cat([input_ids[:, 1:], pad_col], dim=1)
-            # Teacher logits shift: student position j aligns to teacher position j+1
-            teacher_used = torch.cat([teacher_logits[:, 1:, :], teacher_logits[:, -1:, :]], dim=1)
-            # Token-half attention mask shift: [m2..mT, 0]
-            zero_col = torch.zeros((B, 1), device=attention_mask.device, dtype=attention_mask.dtype)
-            token_attention_mask = torch.cat([attention_mask[:, 1:], zero_col], dim=1)
-
-        tok_embeds = self.draft_lm.get_input_embeddings()(tok_ids)  # (B,T,H)
-        inputs_embeds = torch.cat([enc_hidden, tok_embeds], dim=1)  # (B,2T,H)
-
-        # 4D attention bias (dual-block visibility); token-half can use a different padding mask when shift_tokens=1
-        attn_bias = self._dual_block_attn_bias(
-            attention_mask=attention_mask,
-            block_len=block_len,
-            dtype=inputs_embeds.dtype,
-            token_attention_mask=token_attention_mask,
-        )
-
-        # Run transformer body once; apply lm_head only to token half
-        out = self.draft_lm.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn_bias,   # 4D additive mask
-            use_cache=False,
-            return_dict=True,
-        )
-        hidden = out.last_hidden_state           # (B,2T,H)
-        hidden_tok = hidden[:, T:, :]            # (B,T,H)
-        logits_tok = self.draft_lm.lm_head(hidden_tok)  # (B,T,V)
-
-        # Valid positions for KL: for position j, we need both current and "next" tokens to exist.
-        # shift_tokens=0: j uses mask[j] & mask[j+1] (original)
-        # shift_tokens=1: j aligns to original j+1 and predicts original j+2 => mask[j+1] & mask[j+2]
-        valid = torch.zeros((B, T), device=attention_mask.device, dtype=torch.float32)
-        if shift_tokens == 0:
-            valid[:, :-1] = (attention_mask[:, :-1] * attention_mask[:, 1:]).float()
-            valid[:, -1] = 0.0
-        else:
-            if T >= 3:
-                valid[:, :-2] = (attention_mask[:, 1:-1] * attention_mask[:, 2:]).float()
-            valid[:, -2:] = 0.0
-
-        if kl_mode == "full":
-            return self._kl_full_vocab_chunked(
-                teacher_logits=teacher_used,
-                student_logits=logits_tok,
-                valid=valid,
-                chunk_size=kl_chunk_size,
-            )
-
-        # ---- top-k approx (teacher support only) ----
-        t_logits = teacher_used.float()
-        s_logits = logits_tok.float()
-
-        t_topv, t_topi = torch.topk(t_logits, k=min(topk, t_logits.size(-1)), dim=-1)  # (B,T,K)
-        t_probs = torch.softmax(t_topv, dim=-1)  # (B,T,K)
-        s_logp = torch.log_softmax(s_logits, dim=-1).gather(-1, t_topi)  # (B,T,K)
-        ce = -(t_probs * s_logp).sum(dim=-1)  # (B,T)
-
-        loss_sum = (ce * valid).sum()
-        weight_sum = valid.sum().clamp_min(1.0)
-        return loss_sum / weight_sum
-
-    def save_pretrained(self, output_dir: str):
-        self.draft_lm.save_pretrained(output_dir)
-
-    @classmethod
-    def from_pretrained(cls, model_dir: str, trust_remote_code: bool = True) -> "EDDDraftModel":
-        draft = AutoModelForCausalLM.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
-        return cls(draft)
+def load_teacher(
+    target_model: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    trust_remote_code: bool = True,
+):
+    teacher = AutoModelForCausalLM.from_pretrained(
+        target_model,
+        torch_dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        device_map=None,
+    )
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher.to(device)
+    return teacher

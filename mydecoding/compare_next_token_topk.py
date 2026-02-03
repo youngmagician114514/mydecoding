@@ -1,206 +1,221 @@
-import argparse
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Compare Target next-token distributions vs trained Effective_Draft_Decoder checkpoint (.pt).
+
+Prints:
+- Seed token = target greedy next after prompt
+- Target topK for t(i+2) given [prompt, seed]
+- Draft topK for d1 given (enc_hidden(prompt), emb(seed))
+
+This is the quickest sanity-check for whether the trained draft is aligned.
+"""
+
+import argparse, os, sys, json
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-NEG = -1e4  # safe additive bias for bf16/fp16
+# make sure we can import your local models package when running from mydecoding/training
+_THIS = os.path.abspath(__file__)
+_ROOT = os.path.dirname(os.path.dirname(_THIS))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-
-def prefix_plus_causal_attn_bias(prefix_len: int, total_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """
-    4D additive attention bias for draft:
-      - prefix positions: causal inside prefix
-      - token-stream (after prefix): can attend all prefix + causal within stream
-    dtype MUST match query dtype for SDPA.
-    Shape: (1, 1, L, L)
-    """
-    L = total_len
-    bias = torch.full((1, 1, L, L), NEG, device=device, dtype=dtype)
-
-    # prefix causal
-    for i in range(prefix_len):
-        bias[:, :, i, : i + 1] = 0
-
-    # stream causal + can attend prefix
-    for i in range(prefix_len, L):
-        bias[:, :, i, :prefix_len] = 0
-        bias[:, :, i, prefix_len : i + 1] = 0
-
-    return bias
-
-
-def fmt_table(tokenizer, ids, probs):
-    rows = []
-    toks = tokenizer.convert_ids_to_tokens(ids)
-    for i, (tid, piece, p) in enumerate(zip(ids, toks, probs), 1):
-        single = tokenizer.decode([int(tid)], skip_special_tokens=False)
-        disp = single.replace("\n", "\\n").replace("\t", "\\t")
-        rows.append(f"{i:2d}. id={int(tid):6d} piece={piece:<12} dec={disp:<18}  p={p:.6f}")
-    return "\n".join(rows)
+try:
+    from models.edd_draft_model import Effective_Draft_Decoder, load_teacher  # type: ignore
+except Exception:
+    # fallback for other package layouts
+    from mydecoding.models.edd_draft_model import Effective_Draft_Decoder, load_teacher  # type: ignore
 
 
 @torch.no_grad()
-def target_topk_next(model, input_ids, attention_mask, topk=10):
-    """Top-k for next token (logits at last position)."""
-    out = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        return_dict=True,
-    )
-    logits = out.logits[:, -1, :]  # (1, V)
-    probs = F.softmax(logits.float(), dim=-1)  # (1, V)
-    topv, topi = torch.topk(probs, k=topk, dim=-1)  # (1, K)
-    return topi[0].tolist(), topv[0].tolist()
+def greedy_next_id(model, input_ids, attn_mask):
+    out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False, return_dict=True)
+    return int(out.logits[0, -1].argmax().item())
 
 
 @torch.no_grad()
-def edd_draft_topk_first_token_seeded(
-    target_model,
-    draft_model,
-    input_ids,
-    attention_mask,
-    enc_layer_index=-4,
-    topk=10,
-    seed_strategy="greedy",
-):
-    """
-    Compare following your seed-first inference:
+def topk_from_logits(logits, k, tokenizer):
+    probs = F.softmax(logits.float(), dim=-1)
+    topv, topi = torch.topk(probs, k=k, dim=-1)
+    ids = topi[0].tolist()
+    return [(i, tokenizer.decode([i]), float(p)) for i, p in zip(ids, topv[0].tolist())]
 
-    Step A (target on prompt):
-      - enc_hidden = hidden_states[enc_layer_index] over prompt tokens
-      - seed = target predicted next token after prompt (greedy by default)
 
-    Step B (draft on [enc_hidden(prompt), emb(seed)]):
-      - run draft.model on inputs_embeds (prefix hidden + seed embedding)
-      - take LAST position hidden -> lm_head -> distribution over the FIRST draft token d1
+def fmt(rows, title):
+    print(title)
+    for rank, (tid, piece, p) in enumerate(rows, 1):
+        disp = piece.replace("\n", "\\n").replace("\t", "\\t")
+        print(f"{rank:2d}. id={tid:6d} piece={disp:<12} p={p:.6f}")
 
-    Returns:
-      seed_id (int)
-      topk_ids, topk_probs for d1 distribution
-    """
-    # A1) target encode prompt and compute seed
-    out_t = target_model(
+
+def build_prompt(tokenizer, text, use_chat_template: bool):
+    if not use_chat_template:
+        return text
+    if hasattr(tokenizer, "apply_chat_template"):
+        msgs = [{"role": "user", "content": text}]
+        return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    return f"USER: {text}\nASSISTANT:"
+
+
+@torch.no_grad()
+def target_hidden(target, input_ids, attn_mask, enc_layer_index):
+    out = target(
         input_ids=input_ids,
-        attention_mask=attention_mask,
+        attention_mask=attn_mask,
         output_hidden_states=True,
         use_cache=False,
         return_dict=True,
     )
-    enc_hidden = out_t.hidden_states[enc_layer_index]  # (1, T, H)
+    return out.hidden_states[enc_layer_index], out.logits
 
-    if seed_strategy != "greedy":
-        raise ValueError("Only greedy seed supported in this script.")
-    seed_id = int(torch.argmax(out_t.logits[:, -1, :], dim=-1).item())  # token after prompt
 
-    # B1) build inputs_embeds = [enc_hidden(prompt), emb(seed)]
-    seed_tensor = torch.tensor([[seed_id]], device=input_ids.device, dtype=torch.long)
-    seed_emb = draft_model.get_input_embeddings()(seed_tensor)  # (1,1,H)
-    inputs_embeds = torch.cat([enc_hidden, seed_emb], dim=1)    # (1, T+1, H)
+@torch.no_grad()
+def draft_d1_topk(draft: Effective_Draft_Decoder,
+                 target: AutoModelForCausalLM,
+                 tokenizer,
+                 prompt_ids,
+                 prompt_mask,
+                 seed_id: int,
+                 enc_layer_index: int,
+                 topk: int):
+    # enc_hidden for prompt
+    enc_hidden, _ = target_hidden(target, prompt_ids, prompt_mask, enc_layer_index)
 
-    # B2) 4D additive bias mask, dtype aligned to inputs_embeds
-    T = enc_hidden.shape[1]
-    attn_bias = prefix_plus_causal_attn_bias(prefix_len=T, total_len=T + 1, device=input_ids.device, dtype=inputs_embeds.dtype)
+    # Build a minimal token stream of length 1 (seed only).
+    # We feed enc_hidden + tok_emb(seed) into the draft decoder and read the first token-stream logit.
+    B, T, H = enc_hidden.shape
+    seed = torch.tensor([[seed_id]], device=enc_hidden.device, dtype=prompt_ids.dtype)  # (1,1)
+    tok_emb = draft.embedding_layer(seed) if hasattr(draft, "embedding_layer") else draft.get_input_embeddings()(seed)
+    hidden_states = torch.cat([enc_hidden, tok_emb], dim=1)  # (1, T+1, H)
 
-    out_d = draft_model.model(
-        inputs_embeds=inputs_embeds,
-        attention_mask=attn_bias,
-        use_cache=False,
-        return_dict=True,
+    # position_ids: [0..T-1] for enc, then [T] for seed token stream
+    pos = torch.arange(T + 1, device=enc_hidden.device).unsqueeze(0)  # (1, T+1)
+
+    # Build dual-block mask the same way the model does internally
+    attn = draft._build_dual_block_mask(
+        enc_len=T,
+        total_len=T + 1,
+        inp_len=T,      # prompt length
+        pred_len=1,     # token stream length
+        device=enc_hidden.device,
+        dtype=enc_hidden.dtype,
     )
-    h_last = out_d.last_hidden_state[:, -1, :]  # hidden at seed position, used to predict next (d1)
-    logits = draft_model.lm_head(h_last)        # (1, V)
-    probs = F.softmax(logits.float(), dim=-1)
-    topv, topi = torch.topk(probs, k=topk, dim=-1)
+    if attn.size(0) != B:
+        attn = attn.expand(B, -1, -1, -1)
 
-    return seed_id, topi[0].tolist(), topv[0].tolist()
+    # Run draft layers
+    position_embeddings = draft._compute_position_embeddings(hidden_states, pos)
+    x = hidden_states
+
+        
+    for layer in draft.decoder_layers:
+        # --- dtype align (fix float vs bf16 mismatch) ---
+        layer_dtype = next(layer.parameters()).dtype
+        x = x.to(layer_dtype)
+        attn = attn.to(layer_dtype)
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            position_embeddings = (cos.to(layer_dtype), sin.to(layer_dtype))
+        try:
+            out = layer(x, attention_mask=attn, position_ids=pos, position_embeddings=position_embeddings)
+        except TypeError:
+            out = layer(x, attention_mask=attn, position_ids=pos)
+        x = out[0] if isinstance(out, (tuple, list)) else out
+    x = draft.norm(x)
+    logits = draft.lm_head(x)  # (1, T+1, V)
+
+    # token-stream is last pred_len positions => last position corresponds to seed position.
+    # We want d1: next token AFTER seed, which in Faster-SD alignment is the token-stream logit at that position.
+    # Practically: use the last position logits.
+    d1_logits = logits[:, -1, :]  # (1,V)
+    return topk_from_logits(d1_logits, topk, tokenizer)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target_model", required=True)
-    ap.add_argument("--edd_dir", required=True)
+    ap.add_argument("--edd_dir", required=True, help="checkpoint dir containing tokenizer files + draft_decoder_final.pt")
+    ap.add_argument("--draft_ckpt", default=None, help="path to .pt (default: <edd_dir>/draft_decoder_final.pt)")
     ap.add_argument("--prompt", required=True)
+    ap.add_argument("--use_chat_template", action="store_true", help="wrap prompt as a single user turn via chat template")
     ap.add_argument("--enc_layer_index", type=int, default=-4)
-    ap.add_argument("--topk", type=int, default=10)
+    ap.add_argument("--num_layers", type=int, default=1, help="must match training --num_layers")
+    ap.add_argument("--topk", type=int, default=20)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
     if args.bf16 and args.fp16:
-        raise ValueError("Choose at most one of --bf16 / --fp16")
+        raise ValueError("choose at most one of --bf16/--fp16")
 
+    dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+    device = torch.device(args.device)
+
+    ckpt = args.draft_ckpt or os.path.join(args.edd_dir, "draft_decoder_final.pt")
+    assert os.path.exists(ckpt), f"not found: {ckpt}"
+
+    # IMPORTANT: load tokenizer from edd_dir so chat template/special tokens match training
+    tok = AutoTokenizer.from_pretrained(args.edd_dir, trust_remote_code=True, use_fast=True)
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+
+    prompt_text = build_prompt(tok, args.prompt, args.use_chat_template)
+    enc = tok(prompt_text, return_tensors="pt")
+    input_ids = enc["input_ids"].to(device)
+    attn_mask = enc.get("attention_mask", torch.ones_like(input_ids)).to(device)
+
+    # teacher/target
+    target = AutoModelForCausalLM.from_pretrained(args.target_model, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+    for p in target.parameters():
+        p.requires_grad_(False)
+
+    # draft: build from teacher then load weights
+    draft = Effective_Draft_Decoder.from_teacher(target, num_layers=args.num_layers)  # num_layers doesn't matter for loading if ckpt matches
+    draft.to(device).eval()
+    sd = torch.load(ckpt, map_location="cpu")
+    if isinstance(sd, dict) and any(k.startswith("module.") for k in sd.keys()):
+        sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+    draft.load_state_dict(sd, strict=True)
+    
+    draft.eval()
     if args.bf16:
-        dtype = torch.bfloat16
-    elif args.fp16:
-        dtype = torch.float16
+        draft = draft.to(device=device, dtype=torch.bfloat16)
     else:
-        dtype = torch.float32
+        draft = draft.to(device=device)
+        # seed
+    seed_id = greedy_next_id(target, input_ids, attn_mask)
+    seed_piece = tok.decode([seed_id])
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    target = AutoModelForCausalLM.from_pretrained(
-        args.target_model,
-        trust_remote_code=True,
-        torch_dtype=dtype if args.device.startswith("cuda") else None,
-    ).to(args.device).eval()
-
-    draft = AutoModelForCausalLM.from_pretrained(
-        args.edd_dir,
-        trust_remote_code=True,
-        torch_dtype=dtype if args.device.startswith("cuda") else None,
-    ).to(args.device).eval()
-
-    enc = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False)
-    input_ids = enc["input_ids"].to(args.device)
-    attention_mask = enc.get("attention_mask", torch.ones_like(input_ids)).to(args.device)
-
-    # 1) seed from target(prompt)
-    # Also show target topk for t_{i+1}
-    tgt_next_ids, tgt_next_probs = target_topk_next(target, input_ids, attention_mask, topk=args.topk)
-    seed_id = tgt_next_ids[0]  # greedy == top1
-
-    # 2) compare after-seed: target([prompt, seed]) predicts t_{i+2}
-    seed_tensor = torch.tensor([[int(seed_id)]], device=args.device, dtype=torch.long)
+    # target topk for t(i+2) on [prompt, seed]
+    seed_tensor = torch.tensor([[seed_id]], device=device, dtype=input_ids.dtype)
     ids2 = torch.cat([input_ids, seed_tensor], dim=1)
-    mask2 = torch.cat([attention_mask, torch.ones_like(seed_tensor, dtype=attention_mask.dtype)], dim=1)
-    tgt_after_seed_ids, tgt_after_seed_probs = target_topk_next(target, ids2, mask2, topk=args.topk)
+    mask2 = torch.cat([attn_mask, torch.ones_like(seed_tensor)], dim=1)
+    out2 = target(input_ids=ids2, attention_mask=mask2, use_cache=False, return_dict=True)
+    t_i2_logits = out2.logits[:, -1, :]  # next after seed
+    tgt_rows = topk_from_logits(t_i2_logits, args.topk, tok)
 
-    # 3) draft first token distribution d1 using seed-first inference
-    seed_id2, dr_ids, dr_probs = edd_draft_topk_first_token_seeded(
-        target_model=target,
-        draft_model=draft,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        enc_layer_index=args.enc_layer_index,
-        topk=args.topk,
-        seed_strategy="greedy",
-    )
-    assert int(seed_id2) == int(seed_id), "Seed mismatch: target greedy and draft seed should match"
+    # draft topk for d1
+    dr_rows = draft_d1_topk(draft, target, tok, input_ids, attn_mask, seed_id, args.enc_layer_index, args.topk)
 
     print("=" * 80)
     print("PROMPT:")
-    print(args.prompt)
+    print(prompt_text)
     print("=" * 80)
-    print(f"Seed (target greedy next after prompt): id={int(seed_id)} piece={tokenizer.convert_ids_to_tokens([int(seed_id)])[0]} dec={repr(tokenizer.decode([int(seed_id)], skip_special_tokens=False))}")
+    print(f"Seed (target greedy next after prompt): id={seed_id} piece={seed_piece!r}")
     print("-" * 80)
-    print(f"[Target] top{args.topk} for t(i+1) (next after prompt)")
-    print(fmt_table(tokenizer, tgt_next_ids, tgt_next_probs))
+    fmt(tgt_rows, f"[Target] top{args.topk} for t(i+2) (next after seed), i.e. target on [prompt, seed]")
     print("-" * 80)
-    print(f"[Target] top{args.topk} for t(i+2) (next after seed), i.e. target on [prompt, seed]")
-    print(fmt_table(tokenizer, tgt_after_seed_ids, tgt_after_seed_probs))
-    print("-" * 80)
-    print(f"[EDD Draft] top{args.topk} for d1 (first draft token after seed) using enc_layer_index={args.enc_layer_index}")
-    print(fmt_table(tokenizer, dr_ids, dr_probs))
+    fmt(dr_rows, f"[Draft] top{args.topk} for d1 (first draft token after seed) using enc_layer_index={args.enc_layer_index}")
     print("=" * 80)
 
-    # overlap diagnostics
-    tgt2_set = {int(i) for i in tgt_after_seed_ids}
-    overlap = [int(i) for i in dr_ids if int(i) in tgt2_set]
-    print(f"Overlap token-ids between Target(t(i+2)) top{args.topk} and Draft(d1) top{args.topk}: {overlap}")
+    tgt_ids = {tid for tid, _, _ in tgt_rows}
+    dr_ids = {tid for tid, _, _ in dr_rows}
+    overlap = sorted(list(tgt_ids & dr_ids))
+    print(f"Overlap token-ids between Target top{args.topk} and Draft top{args.topk}: {overlap}")
 
 
 if __name__ == "__main__":
