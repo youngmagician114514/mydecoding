@@ -40,15 +40,13 @@ def _select_encoder_out(outputs, hidden_layer: int, layer_indices):
     return torch.stack([outputs.hidden_states[i] for i in layer_indices], dim=1)  # (B,K,T,H)
 
 
-def _append_encoder_out(encoder_out, outputs, hidden_layer: int, layer_indices, acc_ids):
+def _select_accepted_layers(outputs, hidden_layer: int, layer_indices, acc_ids):
     keep_pos = [0] + acc_ids
     if layer_indices is None:
-        add_chunk = outputs.hidden_states[hidden_layer][:, keep_pos, :]  # (B,adv,H)
-        return torch.cat([encoder_out, add_chunk], dim=1)
+        return outputs.hidden_states[hidden_layer][:, keep_pos, :].unsqueeze(1)  # (B,1,adv,H)
 
     cur_layers = torch.stack([outputs.hidden_states[i] for i in layer_indices], dim=1)  # (B,K,1+dlen,H)
-    add_chunk = cur_layers[:, :, keep_pos, :]  # (B,K,adv,H)
-    return torch.cat([encoder_out, add_chunk], dim=2)
+    return cur_layers[:, :, keep_pos, :]  # (B,K,adv,H)
 
 
 parser = argparse.ArgumentParser(description="HumanEval with tree verification")
@@ -59,6 +57,8 @@ parser.add_argument("--draft_model_checkpoint", type=str, default="./draft_model
 parser.add_argument("--hidden_layer", type=int, default=-4, help="Single hidden layer index (used when --fusion_layers is empty)")
 parser.add_argument("--fusion_layers", type=str, default="", help="Comma-separated layer indices, e.g. -3,-2,-1")
 parser.add_argument("--threshold", type=float, default=0.036, help="Draft pruning threshold")
+parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Inference dtype")
+parser.add_argument("--tokenizer_dir", type=str, default="", help="Optional tokenizer cache directory")
 args = parser.parse_args()
 
 num_layers = args.num_layers
@@ -68,6 +68,29 @@ draft_model_model_checkpoint = args.draft_model_checkpoint
 hidden_layer = args.hidden_layer
 fusion_layers = _parse_layers(args.fusion_layers)
 threshold = args.threshold
+
+
+def _resolve_dtype(name: str):
+    if name == "bf16":
+        return torch.bfloat16
+    if name == "fp16":
+        return torch.float16
+    return torch.float32
+
+
+def _load_tokenizer(model_ckpt: str, tok_dir: str):
+    tokenizer_kwargs = {"use_fast": True, "padding_side": "left", "trust_remote_code": True}
+    if tok_dir and os.path.isdir(tok_dir):
+        tokenizer = AutoTokenizer.from_pretrained(tok_dir, **tokenizer_kwargs)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_ckpt, **tokenizer_kwargs)
+        if tok_dir:
+            os.makedirs(tok_dir, exist_ok=True)
+            tokenizer.save_pretrained(tok_dir)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    return tokenizer
 
 
 def load_data(tokenizer: AutoTokenizer):
@@ -103,12 +126,15 @@ def load_data(tokenizer: AutoTokenizer):
 @torch.no_grad()
 def test(batch, llm_model, small_model, eos_id, hidden_layer: int, layer_indices, threshold: float):
     iter_num, sum_acc_num, iter_num_small = 0, 0, 0
+    decode_time_s, decode_tokens = 0.0, 0
 
     for i in tqdm(range(len(batch)), desc="Testing Progress"):
         input_ids = batch[i]["input_ids"].unsqueeze(0).cuda()
         attention_mask_input = batch[i]["input_attention_mask"].unsqueeze(0).cuda()
         label_num = batch[i]["labels_attention_mask"].sum().item()
         cur_num, past_key_values, pred_ids = 0, None, None
+        sample_decode_started = False
+        sample_decode_start = 0.0
 
         while cur_num < label_num:
             iter_num += 1
@@ -117,15 +143,26 @@ def test(batch, llm_model, small_model, eos_id, hidden_layer: int, layer_indices
                 outputs = llm_model(input_ids, attention_mask=attention_mask_input, output_hidden_states=True)
                 past_key_values = outputs.past_key_values
                 encoder_out = _select_encoder_out(outputs, hidden_layer, layer_indices)
+                slot_cache = small_model.init_slot_cache(
+                    encoder_out,
+                    slot_size=small_model.slot_size,
+                    apply_dropout=False,
+                )
                 new_token_1 = outputs.logits[:, -1:, :].argmax(dim=-1)
                 cur_num += 1
+
+            if not sample_decode_started:
+                torch.cuda.synchronize()
+                sample_decode_start = time.perf_counter()
+                sample_decode_started = True
 
             last_past_key_values_len = past_key_values[0][0].shape[2]
 
             small_pred, verify_mask, root, verify_position_ids = small_model.generate(
-                encoder_out=encoder_out,
+                encoder_out=None,
                 decoder_inp_token=new_token_1,
                 threshold=threshold,
+                slot_cache=slot_cache,
             )
             if small_pred.shape[1] == 0:
                 break
@@ -159,6 +196,7 @@ def test(batch, llm_model, small_model, eos_id, hidden_layer: int, layer_indices
             cur_num += acc_num
             sum_acc_num += acc_num
             iter_num_small += max_draft_len
+            decode_tokens += acc_num
             cur_tokens = torch.tensor(acc_token, device="cuda", dtype=torch.long).unsqueeze(0)
             pred_ids = (
                 torch.cat([new_token_1, cur_tokens], dim=1)
@@ -184,29 +222,34 @@ def test(batch, llm_model, small_model, eos_id, hidden_layer: int, layer_indices
                     )
             past_key_values = tuple(tuple(x) for x in past_key_values)
 
-            encoder_out = _append_encoder_out(encoder_out, outputs, hidden_layer, layer_indices, acc_ids)
+            accepted_layers = _select_accepted_layers(outputs, hidden_layer, layer_indices, acc_ids)
+            slot_cache = small_model.update_slot_cache(slot_cache, accepted_layers, apply_dropout=False)
             new_token_1 = pred_ids[:, -1:]
             attention_mask_input = torch.cat([attention_mask_input, torch.ones(1, acc_num).cuda()], dim=1)
 
+        if sample_decode_started:
+            torch.cuda.synchronize()
+            decode_time_s += time.perf_counter() - sample_decode_start
+
+    decode_tps = decode_tokens / max(decode_time_s, 1e-6)
     print(
         "avg accept rate:",
         sum_acc_num / max(iter_num_small, 1),
         "avg accepted length:",
         sum_acc_num / max(iter_num, 1),
     )
+    print("decode time(s):", f"{decode_time_s:.4f}")
+    print("decode tokens:", decode_tokens)
+    print("decode tokens/s:", f"{decode_tps:.4f}")
 
 
 if __name__ == "__main__":
-    tokenizer_kwargs = {"use_fast": True, "padding_side": "left", "trust_remote_code": True}
-    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, **tokenizer_kwargs)
-    tokenizer.save_pretrained("./llama32_3B_tok")
-    tokenizer = AutoTokenizer.from_pretrained("./llama32_3B_tok", use_fast=True, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = _load_tokenizer(model_checkpoint, args.tokenizer_dir.strip())
+    torch_dtype = _resolve_dtype(args.dtype)
 
     model = LlamaForCausalLM.from_pretrained(
         model_checkpoint,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         device_map="auto",
     )
 
@@ -220,16 +263,15 @@ if __name__ == "__main__":
     )
     Draft_Decoder.lm_head.load_state_dict(model.lm_head.state_dict())
     Draft_Decoder.embedding_layer.load_state_dict(model.model.embed_tokens.state_dict())
-    Draft_Decoder = Draft_Decoder.bfloat16()
+    Draft_Decoder = Draft_Decoder.to(dtype=torch_dtype)
     Draft_Decoder.load_state_dict(torch.load(draft_model_model_checkpoint, map_location="cpu"))
 
     model = model.cuda().eval()
-    Draft_Decoder = Draft_Decoder.cuda().bfloat16().eval()
+    Draft_Decoder = Draft_Decoder.cuda().eval()
 
     test_tokenized_datasets = load_data(tokenizer)
 
     print("start testing...")
-    start_time = time.time()
     with torch.no_grad():
         test(
             test_tokenized_datasets,
@@ -240,5 +282,3 @@ if __name__ == "__main__":
             fusion_layers,
             threshold,
         )
-    end_time = time.time()
-    print(f"{end_time - start_time:.4f} seconds")
